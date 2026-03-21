@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module>
+    <rawname>convergentdashboard</rawname>
+    <repo>unsupported</repo>
+    <name>Convergent Dashboard</name>
+    <version>1.0.0</version>
+    <publisher>Convergent Communications</publisher>
+    <license>GPLv3+</license>
+    <licenselink>https://www.gnu.org/licenses/gpl-3.0.txt</licenselink>
+    <type>setup</type>
+    <category>Admin</category>
+    <description>
+        Manage and monitor the Convergent Dashboard Server.
+        View service status, configure credentials,
+        and manage server updates.
+    </description>
+    <supported>
+        <version>17.0</version>
+    </supported>
+    <menuitems>
+        <convergentdashboard>Convergent Dashboard</convergentdashboard>
+    </menuitems>
+    <depends>
+        <module>core</module>
+    </depends>
+    <hooks>
+        <framework namespace="FreePBX\Console\Command" class="Chown">
+            <method namespace="FreePBX\modules" class="Convergentdashboard" callingMethod="fwcChownFiles">chownFreepbx</method>
+        </framework>
+    </hooks>
+</module>

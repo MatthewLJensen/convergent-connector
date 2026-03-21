@@ -1,0 +1,35 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Convergent Dashboard - Test Hook
+ * Runs as root via sysadmin/incron
+ *
+ * Writes a marker file to prove the hook ran and with what privileges.
+ * Used to verify the sysadmin/incron dispatch path works for this module.
+ */
+
+$spoolDir   = '/var/spool/asterisk/incron';
+$markerFile = '/tmp/convergent-hook-test.json';
+
+// Find and clean up our trigger file
+$triggerFile = '';
+$triggerFiles = glob("$spoolDir/convergentdashboard.testhook*");
+
+foreach ($triggerFiles as $tf) {
+    $triggerFile = basename($tf);
+    @unlink($tf);
+}
+
+// Write marker file with proof of execution
+$marker = [
+    'timestamp' => date('c'),
+    'uid'       => posix_getuid(),
+    'user'      => posix_getpwuid(posix_getuid())['name'] ?? exec('whoami'),
+    'trigger'   => $triggerFile,
+    'pid'       => getmypid(),
+];
+
+file_put_contents($markerFile, json_encode($marker, JSON_PRETTY_PRINT) . "\n");
+chmod($markerFile, 0644);
+
+exit(0);

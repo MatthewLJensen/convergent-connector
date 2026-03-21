@@ -1,0 +1,214 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Convergent Dashboard - Apply Update Hook
+ * Runs as root via sysadmin/incron
+ *
+ * Extracts a release tarball, runs npm ci, and restarts the PM2 service.
+ * On failure, restores from backup.
+ *
+ * Log file: /tmp/convergent-applyupdate.log
+ */
+
+$logFile = '/tmp/convergent-applyupdate.log';
+
+function logMsg($msg) {
+    global $logFile;
+    $ts = date('Y-m-d H:i:s');
+    $line = "[{$ts}] {$msg}\n";
+    file_put_contents($logFile, $line, FILE_APPEND);
+    error_log("convergentdashboard applyupdate: $msg");
+}
+
+// Start fresh log for this run
+file_put_contents($logFile, "");
+logMsg("=== Apply Update Hook Started ===");
+logMsg("Running as uid=" . posix_getuid() . " (" . (posix_getpwuid(posix_getuid())['name'] ?? '?') . ")");
+
+$spoolDir = '/var/spool/asterisk/incron';
+
+// Find our trigger file and read params
+$params = [];
+$triggerFiles = glob("$spoolDir/convergentdashboard.applyupdate*");
+logMsg("Found " . count($triggerFiles) . " trigger file(s)");
+
+foreach ($triggerFiles as $tf) {
+    $basename = basename($tf);
+    logMsg("Processing trigger: $basename");
+
+    if (strpos($basename, '.CONTENTS') !== false) {
+        $raw = file_get_contents($tf);
+        if ($raw) {
+            $decoded = @gzuncompress(@base64_decode($raw));
+            if ($decoded) {
+                $params = json_decode($decoded, true) ?: [];
+            }
+        }
+    } elseif (preg_match('/\.applyupdate\.(.+)$/', $basename, $m)) {
+        $encoded = str_replace('_', '/', $m[1]);
+        $decoded = @gzuncompress(@base64_decode($encoded));
+        if ($decoded) {
+            $params = json_decode($decoded, true) ?: [];
+        }
+    }
+
+    // Clean up trigger file
+    @unlink($tf);
+}
+
+logMsg("Params: " . json_encode($params));
+
+$version     = $params['version']      ?? '';
+$tarball     = $params['tarball']       ?? '';
+$installPath = $params['install_path']  ?? '/opt/convergent-server';
+$npmPath     = $params['npm_path']      ?? '/usr/bin/npm';
+
+// Validate inputs
+if (!preg_match('/^\d+\.\d+\.\d+$/', $version)) {
+    logMsg("ERROR: invalid version: '$version'");
+    exit(1);
+}
+
+if (!file_exists($tarball)) {
+    logMsg("ERROR: tarball not found: $tarball");
+    exit(1);
+}
+
+if (!is_dir($installPath)) {
+    logMsg("ERROR: install path not found: $installPath");
+    exit(1);
+}
+
+$backupPath = "{$installPath}.bak";
+
+/**
+ * Run a shell command, log it, and return success/failure
+ */
+function run($cmd, $description) {
+    logMsg("RUN [{$description}]: $cmd");
+    $output = [];
+    $returnCode = 0;
+    exec($cmd . ' 2>&1', $output, $returnCode);
+    $outputStr = implode("\n", $output);
+    if ($returnCode !== 0) {
+        logMsg("FAILED [{$description}] (exit {$returnCode}): {$outputStr}");
+        return false;
+    }
+    if (!empty($outputStr)) {
+        logMsg("OK [{$description}]: {$outputStr}");
+    } else {
+        logMsg("OK [{$description}]");
+    }
+    return true;
+}
+
+/**
+ * Restore from backup and restart
+ */
+function restoreBackup($backupPath, $installPath, $npmPath) {
+    logMsg("RESTORING from backup: {$backupPath} -> {$installPath}");
+    if (is_dir($backupPath)) {
+        run("rm -rf " . escapeshellarg($installPath), "remove failed install");
+        run("cp -a " . escapeshellarg($backupPath) . " " . escapeshellarg($installPath), "restore backup");
+        run("chown -R asterisk:asterisk " . escapeshellarg($installPath), "fix ownership after restore");
+    } else {
+        logMsg("WARNING: no backup found at {$backupPath}");
+    }
+    run("su - asterisk -s /bin/bash -c 'pm2 start convergent-monitoring 2>/dev/null || true'", "restart old version");
+}
+
+// === Begin Update Process ===
+
+logMsg("Starting update to v{$version}");
+logMsg("  tarball:      {$tarball} (" . filesize($tarball) . " bytes)");
+logMsg("  install_path: {$installPath}");
+logMsg("  npm_path:     {$npmPath}");
+logMsg("  backup_path:  {$backupPath}");
+
+// Step 1: Stop PM2 process
+run("su - asterisk -s /bin/bash -c 'pm2 stop convergent-monitoring 2>/dev/null || true'", "stop PM2 process");
+
+// Step 2: Backup current install
+if (is_dir($backupPath)) {
+    run("rm -rf " . escapeshellarg($backupPath), "remove old backup");
+}
+if (!run("cp -a " . escapeshellarg($installPath) . " " . escapeshellarg($backupPath), "backup current install")) {
+    logMsg("ERROR: backup failed, aborting update");
+    run("su - asterisk -s /bin/bash -c 'pm2 start convergent-monitoring 2>/dev/null || true'", "restart after backup failure");
+    exit(1);
+}
+
+// Step 3: Extract tarball
+$preserveDirs = ['node_modules', 'recordings', '.env'];
+$tempPreserve = "/tmp/convergent-update-preserve-" . getmypid();
+run("mkdir -p " . escapeshellarg($tempPreserve), "create temp preserve dir");
+
+foreach ($preserveDirs as $item) {
+    $itemPath = "{$installPath}/{$item}";
+    if (file_exists($itemPath)) {
+        run("mv " . escapeshellarg($itemPath) . " " . escapeshellarg("{$tempPreserve}/{$item}"), "preserve {$item}");
+    } else {
+        logMsg("SKIP preserve {$item} (not found)");
+    }
+}
+
+// Clear install dir and extract
+run("rm -rf " . escapeshellarg($installPath) . "/*", "clear install dir");
+
+$extractCmd = "tar -xzf " . escapeshellarg($tarball) . " -C " . escapeshellarg(dirname($installPath)) . " --strip-components=0";
+if (!run($extractCmd, "extract tarball")) {
+    logMsg("ERROR: extraction failed, restoring backup");
+    foreach ($preserveDirs as $item) {
+        $preservedItem = "{$tempPreserve}/{$item}";
+        if (file_exists($preservedItem)) {
+            run("mv " . escapeshellarg($preservedItem) . " " . escapeshellarg("{$installPath}/{$item}"), "restore preserved {$item}");
+        }
+    }
+    run("rm -rf " . escapeshellarg($tempPreserve), "cleanup temp preserve");
+    restoreBackup($backupPath, $installPath, $npmPath);
+    exit(1);
+}
+
+// Verify extraction produced files
+$extractedFiles = @scandir($installPath);
+logMsg("Files in {$installPath} after extraction: " . json_encode($extractedFiles ?: []));
+
+// Restore preserved directories
+foreach ($preserveDirs as $item) {
+    $preservedItem = "{$tempPreserve}/{$item}";
+    if (file_exists($preservedItem)) {
+        $targetItem = "{$installPath}/{$item}";
+        if (file_exists($targetItem)) {
+            run("rm -rf " . escapeshellarg($targetItem), "remove tarball {$item}");
+        }
+        run("mv " . escapeshellarg($preservedItem) . " " . escapeshellarg($targetItem), "restore {$item}");
+    }
+}
+run("rm -rf " . escapeshellarg($tempPreserve), "cleanup temp preserve");
+
+// Step 4: Run npm ci as asterisk user
+$npmCmd = "cd " . escapeshellarg($installPath) . " && " . escapeshellarg($npmPath) . " ci --production";
+$npmFullCmd = "su - asterisk -s /bin/bash -c " . escapeshellarg($npmCmd);
+if (!run($npmFullCmd, "npm ci")) {
+    logMsg("ERROR: npm ci failed, restoring backup");
+    restoreBackup($backupPath, $installPath, $npmPath);
+    exit(1);
+}
+
+// Step 5: Set ownership
+run("chown -R asterisk:asterisk " . escapeshellarg($installPath), "set ownership");
+
+// Step 6: Verify version
+$pkgJson = "{$installPath}/package.json";
+if (file_exists($pkgJson)) {
+    $pkg = json_decode(file_get_contents($pkgJson), true);
+    logMsg("Installed package.json version: " . ($pkg['version'] ?? 'unknown'));
+} else {
+    logMsg("WARNING: package.json not found after extraction!");
+}
+
+// Step 7: Restart PM2 process
+run("su - asterisk -s /bin/bash -c 'pm2 start convergent-monitoring'", "restart PM2 process");
+
+logMsg("=== Update to v{$version} completed successfully ===");
+exit(0);
