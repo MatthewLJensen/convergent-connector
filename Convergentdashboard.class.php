@@ -628,6 +628,7 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
                     // Delete existing instance first to avoid duplicates
                     try { $pm2->delete($name); } catch (\Exception $e) {}
                     $pm2->start($name, $scriptPath);
+                    try { $pm2->save(); } catch (\Exception $e) {}
                     break;
                 case 'stop':
                     $pm2->stop($name);
@@ -1751,6 +1752,7 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
         // Start via PM2
         try {
             \FreePBX::Pm2()->start("convergent-monitoring", $scriptPath);
+            try { \FreePBX::Pm2()->save(); } catch (\Exception $e) {}
         } catch (\Exception $e) {
             return ['status' => false, 'message' => 'Failed to start: ' . $e->getMessage()];
         }
@@ -1762,6 +1764,100 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             'message' => 'Service started successfully via PM2',
             'details' => ['Start script created', 'Service started via PM2']
         ];
+    }
+
+    // =========================================================================
+    // Dialplan Generation & Destination Registration
+    // =========================================================================
+
+    /**
+     * Called by FreePBX during fwconsole reload to inject Asterisk dialplan.
+     *
+     * FreePBX rebuilds extensions_additional.conf from scratch on each reload
+     * by having every module append its dialplan here. Writing to a standalone
+     * file without an #include would mean Asterisk never loads it, so we append
+     * directly to extensions_additional.conf — which is the standard FreePBX
+     * module pattern.
+     */
+    public function generate()
+    {
+        $conf  = "\n; *** Convergent Dashboard - auto-generated, do not edit ***\n\n";
+        $conf .= "[convergent-fax-receive]\n";
+        $conf .= "exten => s,1,NoOp(=== INBOUND FAX TEST ===)\n";
+        $conf .= "same => n,Set(FAXOPT(ecm)=yes)\n";
+        $conf .= "same => n,Set(FAXOPT(minrate)=4800)\n";
+        $conf .= "same => n,Set(FAXOPT(maxrate)=14400)\n";
+        $conf .= "same => n,Set(FAXFILE=\${ASTSPOOLDIR}/fax/\${UNIQUEID}.tif)\n";
+        $conf .= "same => n,StopPlaytones()\n";
+        $conf .= "same => n,ReceiveFAX(\${FAXFILE},zf)\n";
+        $conf .= "same => n,NoOp(FAX Result: \${FAXSTATUS} - \${FAXSTATUSSTRING})\n";
+        $conf .= "same => n,NoOp(Saved to: \${FAXFILE})\n";
+        $conf .= "same => n,Set(FAX_RESULT_STATUS=\${FAXSTATUS})\n";
+        $conf .= "same => n,Set(FAX_RESULT_ERROR=\${FAXERROR})\n";
+        $conf .= "same => n,Set(FAX_RESULT_STATUSSTRING=\${FAXSTATUSSTRING})\n";
+        $conf .= "same => n,Set(FAX_RESULT_MODE=\${FAXMODE})\n";
+        $conf .= "same => n,Hangup()\n";
+        $conf .= "\n";
+        $conf .= "[convergent-fax-send]\n";
+        $conf .= "exten => s,1,NoOp(=== CONVERGENT OUTBOUND FAX (via s extension) ===)\n";
+        $conf .= "same => n,NoOp(Fax ID: \${FAXID})\n";
+        $conf .= "same => n,NoOp(Destination: \${DESTINATION})\n";
+        $conf .= "same => n,NoOp(File: \${FAXFILE})\n";
+        $conf .= "same => n,NoOp(Trunk: \${FAXTRUNK})\n";
+        $conf .= "same => n,Set(FAXOPT(ecm)=yes)\n";
+        $conf .= "same => n,Set(FAXOPT(headerinfo)=\${FAXHEADER})\n";
+        $conf .= "same => n,Set(FAXOPT(localstationid)=\${CALLERID(num)})\n";
+        $conf .= "same => n,Set(FAXOPT(minrate)=4800)\n";
+        $conf .= "same => n,Set(FAXOPT(maxrate)=14400)\n";
+        $conf .= "same => n,Wait(1)\n";
+        $conf .= "same => n,SendFAX(\${FAXFILE},zf)\n";
+        $conf .= "same => n,NoOp(FAX Result: \${FAXSTATUS} - \${FAXSTATUSSTRING})\n";
+        $conf .= "same => n,NoOp(Pages: \${FAXPAGES}, Rate: \${FAXBITRATE}, Mode: \${FAXMODE})\n";
+        $conf .= "same => n,Set(FAX_RESULT_STATUS=\${FAXSTATUS})\n";
+        $conf .= "same => n,Set(FAX_RESULT_ERROR=\${FAXERROR})\n";
+        $conf .= "same => n,Set(FAX_RESULT_STATUSSTRING=\${FAXSTATUSSTRING})\n";
+        $conf .= "same => n,Set(FAX_RESULT_MODE=\${FAXMODE})\n";
+        $conf .= "same => n,Hangup()\n";
+        $conf .= "\n; *** End Convergent Dashboard ***\n";
+
+        file_put_contents('/etc/asterisk/extensions_additional.conf', $conf, FILE_APPEND);
+    }
+
+    /**
+     * Returns the list of destinations this module exposes for routing.
+     * FreePBX uses this to populate destination dropdowns (inbound routes,
+     * IVR, ring groups, etc.).
+     *
+     * @return array
+     */
+    public function getDestinations()
+    {
+        return [
+            [
+                'destination' => 'convergent-fax-receive,s,1',
+                'description' => 'Convergent Fax: Receive Fax',
+                'category'    => _('Convergent'),
+            ],
+        ];
+    }
+
+    /**
+     * Returns the dialplan routing target for a destination registered above.
+     * FreePBX calls this when building the goto logic for a selected destination.
+     *
+     * @param  string $destination  The destination string from getDestinations()
+     * @return array|null
+     */
+    public function getDestination($destination)
+    {
+        if ($destination === 'convergent-fax-receive,s,1') {
+            return [
+                'context' => 'convergent-fax-receive',
+                'exten'   => 's',
+                'priority' => 1,
+            ];
+        }
+        return null;
     }
 
     /**

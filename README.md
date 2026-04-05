@@ -15,25 +15,19 @@ A FreePBX 17 module for managing and monitoring the Convergent Dashboard Server.
 
 ## Installation
 
-### Method 1: Manual Installation
+```bash
+git clone https://github.com/MatthewLJensen/convergent-connector \
+    /var/www/html/admin/modules/convergentdashboard
+chown -R asterisk:asterisk /var/www/html/admin/modules/convergentdashboard
+fwconsole ma install convergentdashboard
+fwconsole reload
+```
 
-1. Copy the `freepbx_module` directory to `/var/www/html/admin/modules/convergentdashboard`
-2. Navigate to Admin > Module Admin in FreePBX
-3. Click "Manage local modules"
-4. Find "Convergent Dashboard" and click "Install"
-5. Click "Process" and "Confirm"
-
-### Method 2: Command Line
+## Upgrading
 
 ```bash
-# Copy the module
-cp -r freepbx_module /var/www/html/admin/modules/convergentdashboard
-
-# Set permissions
-chown -R asterisk:asterisk /var/www/html/admin/modules/convergentdashboard
-
-# Install via fwconsole
-fwconsole ma install convergentdashboard
+cd /var/www/html/admin/modules/convergentdashboard
+git pull origin main
 fwconsole reload
 ```
 
