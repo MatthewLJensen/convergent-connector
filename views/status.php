@@ -417,6 +417,42 @@ dnf install nodejs
     </div>
 </div>
 
+<!-- Module Version -->
+<div class="panel panel-default">
+    <div class="panel-heading">
+        <h3 class="panel-title"><i class="fa fa-puzzle-piece"></i> FreePBX Module Version</h3>
+    </div>
+    <div class="panel-body">
+        <table class="table table-bordered">
+            <tr>
+                <th width="200">Installed Version</th>
+                <td>
+                    <?php if ($moduleVersion['status']): ?>
+                        <span class="label label-primary"><?php echo htmlspecialchars($moduleVersion['version']); ?></span>
+                    <?php else: ?>
+                        <span class="text-muted">Unknown</span>
+                    <?php endif; ?>
+                </td>
+            </tr>
+            <tr>
+                <th>Repository</th>
+                <td>
+                    <a href="https://github.com/MatthewLJensen/convergent-connector" target="_blank">
+                        <i class="fa fa-github"></i> MatthewLJensen/convergent-connector
+                    </a>
+                </td>
+            </tr>
+        </table>
+
+        <div style="margin-top: 15px;">
+            <button type="button" class="btn btn-default" id="btn-check-module-update">
+                <i class="fa fa-refresh"></i> Check for Module Update
+            </button>
+            <span id="module-update-status" class="text-muted" style="margin-left: 10px;"></span>
+        </div>
+    </div>
+</div>
+
 <!-- Quick Actions -->
 <div class="panel panel-default">
     <div class="panel-heading">

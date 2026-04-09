@@ -1,0 +1,121 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Convergent Dashboard - Install Module Hook
+ * Runs as root via sysadmin/incron
+ *
+ * Extracts a GitHub zipball and installs it as this FreePBX module,
+ * then runs fwconsole reload to pick up the new code.
+ *
+ * Log file: /tmp/convergent-installmodule.log
+ */
+
+$logFile = '/tmp/convergent-installmodule.log';
+
+function logMsg($msg) {
+    global $logFile;
+    file_put_contents($logFile, "[" . date('Y-m-d H:i:s') . "] {$msg}\n", FILE_APPEND);
+    error_log("convergentdashboard installmodule: $msg");
+}
+
+file_put_contents($logFile, "");
+logMsg("=== Install Module Hook Started ===");
+logMsg("Running as uid=" . posix_getuid() . " (" . (posix_getpwuid(posix_getuid())['name'] ?? '?') . ")");
+
+$spoolDir = '/var/spool/asterisk/incron';
+$params   = [];
+
+$triggerFiles = glob("$spoolDir/convergentdashboard.installmodule*");
+logMsg("Found " . count($triggerFiles) . " trigger file(s)");
+
+foreach ($triggerFiles as $tf) {
+    $basename = basename($tf);
+    if (strpos($basename, '.CONTENTS') !== false) {
+        $raw = file_get_contents($tf);
+        if ($raw) {
+            $decoded = @gzuncompress(@base64_decode($raw));
+            if ($decoded) $params = json_decode($decoded, true) ?: [];
+        }
+    } elseif (preg_match('/\.installmodule\.(.+)$/', $basename, $m)) {
+        $encoded = str_replace('_', '/', $m[1]);
+        $decoded = @gzuncompress(@base64_decode($encoded));
+        if ($decoded) $params = json_decode($decoded, true) ?: [];
+    }
+    @unlink($tf);
+}
+
+logMsg("Params: " . json_encode($params));
+
+$zipFile    = $params['file']        ?? '';
+$modulePath = $params['module_path'] ?? '';
+
+if (empty($zipFile) || !file_exists($zipFile)) {
+    logMsg("ERROR: zip file not found: '$zipFile'");
+    exit(1);
+}
+if (empty($modulePath) || !is_dir($modulePath)) {
+    logMsg("ERROR: module path not found: '$modulePath'");
+    exit(1);
+}
+
+logMsg("Zip:    $zipFile (" . filesize($zipFile) . " bytes)");
+logMsg("Target: $modulePath");
+
+// Extract zip to a temp directory
+$extractDir = "/tmp/convergent-module-extract-" . getmypid();
+@mkdir($extractDir, 0755, true);
+
+$output = [];
+$code   = 0;
+exec("unzip -q " . escapeshellarg($zipFile) . " -d " . escapeshellarg($extractDir) . " 2>&1", $output, $code);
+if ($code !== 0) {
+    logMsg("ERROR: unzip failed (exit $code): " . implode("\n", $output));
+    exec("rm -rf " . escapeshellarg($extractDir));
+    exit(1);
+}
+
+// GitHub zipballs have one top-level directory: e.g. MatthewLJensen-convergent-connector-abc123/
+$entries = array_values(array_filter(scandir($extractDir), fn($e) => $e !== '.' && $e !== '..'));
+if (count($entries) !== 1) {
+    logMsg("ERROR: expected one top-level directory in zip, found: " . implode(', ', $entries));
+    exec("rm -rf " . escapeshellarg($extractDir));
+    exit(1);
+}
+
+$sourceDir = $extractDir . '/' . $entries[0];
+logMsg("Source dir: $sourceDir");
+
+// Copy module files into place
+$cpOutput = [];
+$cpCode   = 0;
+exec("cp -a " . escapeshellarg($sourceDir) . "/. " . escapeshellarg($modulePath) . "/ 2>&1", $cpOutput, $cpCode);
+if ($cpCode !== 0) {
+    logMsg("ERROR: cp failed (exit $cpCode): " . implode("\n", $cpOutput));
+    exec("rm -rf " . escapeshellarg($extractDir));
+    exit(1);
+}
+logMsg("Files copied to $modulePath");
+
+// Fix ownership
+exec("chown -R asterisk:asterisk " . escapeshellarg($modulePath) . " 2>&1");
+
+// Clean up temp dir
+exec("rm -rf " . escapeshellarg($extractDir));
+
+// Run fwconsole reload
+$fwconsole = '/usr/sbin/fwconsole';
+if (!file_exists($fwconsole)) {
+    $fwconsole = trim(shell_exec('which fwconsole 2>/dev/null') ?: '');
+}
+
+if (!empty($fwconsole) && file_exists($fwconsole)) {
+    $reloadOutput = [];
+    $reloadCode   = 0;
+    exec(escapeshellarg($fwconsole) . " reload --skip-registry-checks 2>&1", $reloadOutput, $reloadCode);
+    logMsg("fwconsole reload exit $reloadCode: " . implode(" | ", $reloadOutput));
+} else {
+    logMsg("WARNING: fwconsole not found — skipping reload. Run 'fwconsole reload' manually.");
+}
+
+logMsg("=== Module installation complete ===");
+exit(0);

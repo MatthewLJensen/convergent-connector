@@ -13,8 +13,9 @@ $convergent = FreePBX::Convergentdashboard();
 $activeTab = isset($_GET['tab']) ? $_GET['tab'] : 'status';
 
 // Get current data
-$config = $convergent->getAllConfig();
-$version = $convergent->getInstalledVersion();
+$config        = $convergent->getAllConfig();
+$version       = $convergent->getInstalledVersion();
+$moduleVersion = $convergent->getModuleVersion();
 
 // Only run expensive checks on the status tab
 if ($activeTab === 'status') {

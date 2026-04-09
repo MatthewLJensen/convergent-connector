@@ -102,6 +102,11 @@
             $('#btn-setup-service').on('click', function() {
                 self.setupService();
             });
+
+            // Check for module update button
+            $('#btn-check-module-update').on('click', function() {
+                self.checkModuleUpdate();
+            });
         },
 
         // Initialize password toggle buttons
@@ -681,6 +686,92 @@
                     alert('Commands copied to clipboard!');
                 });
             }
+        },
+
+        // Check GitHub for a newer module version
+        checkModuleUpdate: function() {
+            var self = this;
+            var $btn    = $('#btn-check-module-update');
+            var $status = $('#module-update-status');
+            var originalHtml = $btn.html();
+
+            $btn.prop('disabled', true).html('<span class="loading-spinner"></span> Checking...');
+            $status.html('');
+
+            $.ajax({
+                url: 'ajax.php',
+                type: 'POST',
+                dataType: 'json',
+                data: {
+                    module: 'convergentdashboard',
+                    command: 'check_module_update'
+                },
+                success: function(response) {
+                    $btn.prop('disabled', false).html(originalHtml);
+                    if (!response.status) {
+                        $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> ' + self.escapeHtml(response.message) + '</span>');
+                        return;
+                    }
+                    if (response.update_available) {
+                        var html = '<span class="text-success"><i class="fa fa-arrow-circle-up"></i> ' + self.escapeHtml(response.message) + '</span>';
+                        if (response.release_notes) {
+                            html += '<br><small class="text-muted">' + self.escapeHtml(response.release_notes) + '</small>';
+                        }
+                        html += '<br><button type="button" class="btn btn-success btn-sm" id="btn-install-module-update" style="margin-top: 8px;"'
+                              + ' data-tag="' + self.escapeHtml(response.tag_name) + '"'
+                              + ' data-zipball="' + self.escapeHtml(response.zipball_url) + '">'
+                              + '<i class="fa fa-download"></i> Install v' + self.escapeHtml(response.latest_version) + '</button>';
+                        $status.html(html);
+
+                        $('#btn-install-module-update').on('click', function() {
+                            self.installModuleUpdate($(this).data('tag'), $(this).data('zipball'));
+                        });
+                    } else {
+                        $status.html('<span class="text-muted"><i class="fa fa-check-circle"></i> ' + self.escapeHtml(response.message) + '</span>');
+                    }
+                },
+                error: function(xhr, status, error) {
+                    $btn.prop('disabled', false).html(originalHtml);
+                    $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> Check failed: ' + error + '</span>');
+                }
+            });
+        },
+
+        // Download and install a module update from GitHub
+        installModuleUpdate: function(tagName, zipballUrl) {
+            var self = this;
+            var $btn    = $('#btn-install-module-update');
+            var $status = $('#module-update-status');
+
+            $btn.prop('disabled', true).html('<span class="loading-spinner"></span> Installing...');
+            $status.find('span:first').html('<span class="text-info"><i class="fa fa-spinner fa-spin"></i> Downloading and installing — this may take a moment...</span>');
+
+            $.ajax({
+                url: 'ajax.php',
+                type: 'POST',
+                dataType: 'json',
+                timeout: 90000,
+                data: {
+                    module:      'convergentdashboard',
+                    command:     'install_module_update',
+                    tag_name:    tagName,
+                    zipball_url: zipballUrl
+                },
+                success: function(response) {
+                    if (response.status) {
+                        $status.html('<span class="text-success"><i class="fa fa-check-circle"></i> ' + self.escapeHtml(response.message) + '</span>');
+                        setTimeout(function() { location.reload(); }, 2000);
+                    } else {
+                        $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> ' + self.escapeHtml(response.message) + '</span>');
+                        $btn.prop('disabled', false).html('<i class="fa fa-download"></i> Retry');
+                    }
+                },
+                error: function(xhr, status, error) {
+                    $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> Request failed: ' + error
+                        + '</span><br><small class="text-muted">Check /tmp/convergent-installmodule.log on the server.</small>');
+                    $btn.prop('disabled', false).html('<i class="fa fa-download"></i> Retry');
+                }
+            });
         },
 
         // HTML escape helper

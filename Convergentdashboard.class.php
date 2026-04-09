@@ -28,6 +28,9 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
     /** Where the server code lives */
     private const INSTALL_PATH = '/opt/convergent-server';
 
+    /** GitHub API base for this module's releases */
+    private const MODULE_GITHUB_API = 'https://api.github.com/repos/MatthewLJensen/convergent-connector';
+
     public function install()
     {
         // install() runs as root via fwconsole
@@ -97,6 +100,8 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             'test_hook',
             'download_update',
             'apply_update',
+            'check_module_update',
+            'install_module_update',
         ];
         return in_array($req, $allowed);
     }
@@ -163,6 +168,14 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
                 $version = $_POST['version'] ?? '';
                 $sha256 = $_POST['sha256'] ?? '';
                 return $this->applyUpdate($version, $sha256);
+
+            case 'check_module_update':
+                return $this->checkModuleUpdate();
+
+            case 'install_module_update':
+                $tagName    = $_POST['tag_name']    ?? '';
+                $zipballUrl = $_POST['zipball_url']  ?? '';
+                return $this->downloadInstallModule($tagName, $zipballUrl);
 
             default:
                 return ['status' => false, 'message' => 'Unknown command'];
@@ -1307,6 +1320,156 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
         return [
             'status' => !empty($logContent),
             'logs' => $logContent ?: 'No logs available. The service may not have been started yet.'
+        ];
+    }
+
+    /**
+     * Module Self-Update
+     */
+
+    /**
+     * Read the installed module version from module.xml
+     */
+    public function getModuleVersion()
+    {
+        $xmlPath = __DIR__ . '/module.xml';
+        if (!file_exists($xmlPath)) {
+            return ['status' => false, 'version' => null, 'message' => 'module.xml not found'];
+        }
+        $xml = simplexml_load_file($xmlPath);
+        if (!$xml) {
+            return ['status' => false, 'version' => null, 'message' => 'Could not parse module.xml'];
+        }
+        return [
+            'status'  => true,
+            'version' => (string)$xml->version,
+            'name'    => (string)$xml->name,
+        ];
+    }
+
+    /**
+     * Check GitHub releases for a newer module version
+     */
+    public function checkModuleUpdate()
+    {
+        $current    = $this->getModuleVersion();
+        $currentVer = $current['version'] ?? null;
+
+        $ch = curl_init(self::MODULE_GITHUB_API . '/releases/latest');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => [
+                'Accept: application/vnd.github+json',
+                'User-Agent: FreePBX-ConvergentDashboard/' . ($currentVer ?? '1.0'),
+            ],
+            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_SSL_VERIFYPEER => true,
+        ]);
+        $response  = curl_exec($ch);
+        $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+
+        if ($response === false) {
+            return ['status' => false, 'message' => "Connection failed: {$curlError}"];
+        }
+        if ($httpCode === 404) {
+            return ['status' => false, 'message' => 'No releases found on GitHub'];
+        }
+        if ($httpCode !== 200) {
+            return ['status' => false, 'message' => "GitHub returned HTTP {$httpCode}"];
+        }
+
+        $data = json_decode($response, true);
+        if (!$data || empty($data['tag_name'])) {
+            return ['status' => false, 'message' => 'Could not parse GitHub release data'];
+        }
+
+        $latestVer       = ltrim($data['tag_name'], 'v');
+        $updateAvailable = $currentVer ? ($this->compareVersions($latestVer, $currentVer) > 0) : true;
+
+        return [
+            'status'          => true,
+            'current_version' => $currentVer ?? 'unknown',
+            'latest_version'  => $latestVer,
+            'tag_name'        => $data['tag_name'],
+            'update_available' => $updateAvailable,
+            'zipball_url'     => $data['zipball_url'] ?? '',
+            'release_notes'   => $data['body'] ?? '',
+            'message'         => $updateAvailable
+                ? "Update available: v{$latestVer}"
+                : "Module is up to date (v{$currentVer})",
+        ];
+    }
+
+    /**
+     * Download a GitHub zipball and install it via the installmodule root hook
+     */
+    public function downloadInstallModule($tagName, $zipballUrl)
+    {
+        if (empty($tagName) || empty($zipballUrl)) {
+            return ['status' => false, 'message' => 'Tag name and download URL are required'];
+        }
+
+        $safeTag  = preg_replace('/[^a-zA-Z0-9._-]/', '', $tagName);
+        $destFile = "/tmp/convergentdashboard-{$safeTag}.zip";
+
+        freepbx_log(FPBX_LOG_NOTICE, "Convergent downloadInstallModule: downloading {$tagName}");
+
+        $fp = fopen($destFile, 'w');
+        if (!$fp) {
+            return ['status' => false, 'message' => 'Failed to open destination file for writing'];
+        }
+
+        $currentVer = $this->getModuleVersion()['version'] ?? '1.0';
+        $ch = curl_init($zipballUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_HTTPHEADER     => [
+                'Accept: application/vnd.github+json',
+                'User-Agent: FreePBX-ConvergentDashboard/' . $currentVer,
+            ],
+            CURLOPT_FILE           => $fp,
+            CURLOPT_TIMEOUT        => 60,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+        ]);
+        $success   = curl_exec($ch);
+        $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+        fclose($fp);
+
+        if (!$success || $httpCode !== 200) {
+            @unlink($destFile);
+            return ['status' => false, 'message' => "Download failed (HTTP {$httpCode}): {$curlError}"];
+        }
+
+        $fileSize = filesize($destFile);
+        if ($fileSize < 1024) {
+            @unlink($destFile);
+            return ['status' => false, 'message' => 'Downloaded file is too small — likely an error response'];
+        }
+
+        freepbx_log(FPBX_LOG_NOTICE, "Convergent downloadInstallModule: {$fileSize} bytes downloaded, triggering install hook");
+
+        $hookResult = $this->runHook('installmodule', [
+            'file'        => $destFile,
+            'module_path' => __DIR__,
+        ], 60);
+
+        @unlink($destFile);
+
+        if (!$hookResult) {
+            return [
+                'status'  => false,
+                'message' => 'Module downloaded but the installation hook timed out. '
+                    . 'Check /tmp/convergent-installmodule.log for details.',
+            ];
+        }
+
+        return [
+            'status'  => true,
+            'message' => "Module updated to {$tagName}. Reloading...",
         ];
     }
 
