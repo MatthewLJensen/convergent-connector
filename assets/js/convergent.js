@@ -45,66 +45,59 @@
         bindEvents: function() {
             var self = this;
 
+            // Use a namespace (.cvg) on all handlers so .off() removes any
+            // previously registered copies before re-adding. FreePBX loads
+            // module pages both as a full page and via its admin framework,
+            // causing this function to run twice and duplicate delegated
+            // handlers — the namespace prevents that from stacking.
+
             // Service action buttons
-            $(document).on('click', '.btn-service-action', function() {
+            $(document).off('click.cvg-service', '.btn-service-action')
+                       .on('click.cvg-service', '.btn-service-action', function() {
                 var action = $(this).data('action');
                 self.serviceAction(action);
             });
 
-            // Refresh status button
-            $('#btn-refresh-status').on('click', function() {
-                self.refreshStatus();
-            });
-
-            // Check for updates button
-            $('#btn-check-update').on('click', function() {
-                self.checkForUpdates();
-            });
-
-            // Test connection button
-            $('#btn-test-connection').on('click', function() {
-                self.testConnection();
-            });
-
-            // Refresh credentials button (credentials tab)
-            $('#btn-refresh-credentials').on('click', function() {
-                self.reloadPage();
-            });
-
-            // Save and restart button
-            $('#btn-save-and-restart').on('click', function() {
-                self.saveAndRestart();
-            });
-
             // Auto-detect buttons in settings tab (per-section)
-            $(document).on('click', '.btn-auto-detect', function() {
+            $(document).off('click.cvg-detect', '.btn-auto-detect')
+                       .on('click.cvg-detect', '.btn-auto-detect', function() {
                 var type = $(this).data('type');
                 self.autoDetectCredentials(type);
             });
 
-            // Auto-detect all credentials button
-            $('#btn-auto-detect-all').on('click', function() {
-                self.autoDetectAllCredentials();
-            });
-
             // Copy to settings buttons (from credentials tab)
-            $(document).on('click', '.btn-copy-to-settings', function() {
+            $(document).off('click.cvg-copy', '.btn-copy-to-settings')
+                       .on('click.cvg-copy', '.btn-copy-to-settings', function() {
                 var type = $(this).data('type');
                 self.copyToSettings(type);
             });
 
-            // Copy all to settings button
-            $('#btn-copy-all-to-settings').on('click', function() {
+            // Direct element handlers — .off().on() also deduplicates these
+            $('#btn-refresh-status').off('click.cvg').on('click.cvg', function() {
+                self.refreshStatus();
+            });
+            $('#btn-check-update').off('click.cvg').on('click.cvg', function() {
+                self.checkForUpdates();
+            });
+            $('#btn-test-connection').off('click.cvg').on('click.cvg', function() {
+                self.testConnection();
+            });
+            $('#btn-refresh-credentials').off('click.cvg').on('click.cvg', function() {
+                self.reloadPage();
+            });
+            $('#btn-save-and-restart').off('click.cvg').on('click.cvg', function() {
+                self.saveAndRestart();
+            });
+            $('#btn-auto-detect-all').off('click.cvg').on('click.cvg', function() {
+                self.autoDetectAllCredentials();
+            });
+            $('#btn-copy-all-to-settings').off('click.cvg').on('click.cvg', function() {
                 self.copyAllToSettings();
             });
-
-            // Setup service button
-            $('#btn-setup-service').on('click', function() {
+            $('#btn-setup-service').off('click.cvg').on('click.cvg', function() {
                 self.setupService();
             });
-
-            // Check for module update button
-            $('#btn-check-module-update').on('click', function() {
+            $('#btn-check-module-update').off('click.cvg').on('click.cvg', function() {
                 self.checkModuleUpdate();
             });
         },
