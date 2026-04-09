@@ -6,6 +6,14 @@
 (function($) {
     'use strict';
 
+    // FreePBX loads module pages both as a full page and via its admin
+    // framework's dynamic loader, causing this script to execute twice.
+    // Exit immediately on the second run so no handlers are doubled.
+    if (window._convergentLoaded) {
+        return;
+    }
+    window._convergentLoaded = true;
+
     // Module namespace
     var Convergent = {
         // Store detected credentials for copy-to-settings functionality
