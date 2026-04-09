@@ -638,12 +638,15 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
                     if (!file_exists($scriptPath)) {
                         return ['status' => false, 'message' => 'Start script not found. Click "Setup Service" first.'];
                     }
-                    // FreePBX PM2 start() handles delete+start internally.
-                    // Use force=true to bypass the "already online" guard and ensure
-                    // the process is always replaced cleanly.
-                    $pm2->start($name, $scriptPath, [], true);
-                    // Update the PM2 dump so the startup service doesn't resurrect stale entries.
-                    $this->savePm2Dump();
+                    // If the process is already registered in PM2 (stopped/errored),
+                    // use restart() — it operates by name and never creates a second entry.
+                    // Only call start() when the process is absent entirely.
+                    $existing = $pm2->getStatus($name);
+                    if (!empty($existing)) {
+                        $pm2->restart($name);
+                    } else {
+                        $pm2->start($name, $scriptPath);
+                    }
                     break;
                 case 'stop':
                     $pm2->stop($name);
@@ -1007,33 +1010,19 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
      */
     private function restartService()
     {
+        $pm2  = \FreePBX::Pm2();
+        $name = 'convergent-monitoring';
+        $script = '/var/lib/asterisk/convergent-start.sh';
         try {
-            // force=true: FreePBX PM2 start() deletes+restarts unconditionally
-            \FreePBX::Pm2()->start("convergent-monitoring", '/var/lib/asterisk/convergent-start.sh', [], true);
-            $this->savePm2Dump();
+            $existing = $pm2->getStatus($name);
+            if (!empty($existing)) {
+                $pm2->restart($name);
+            } else {
+                $pm2->start($name, $script);
+            }
         } catch (\Exception $e) {
             freepbx_log(FPBX_LOG_ERROR, "Convergent restartService: failed: " . $e->getMessage());
         }
-    }
-
-    /**
-     * Persist the current PM2 process list to the dump file so the startup
-     * service (pm2-asterisk.service / pm2 resurrect) doesn't reload stale
-     * entries.  FreePBX's Pm2 class has no save() method, so we shell out.
-     */
-    private function savePm2Dump()
-    {
-        $pm2 = \FreePBX::Pm2();
-        // Locate the pm2 binary from the FreePBX PM2 module's own directory
-        $ref    = new \ReflectionClass($pm2);
-        $pm2bin = dirname($ref->getFileName()) . '/node/node_modules/pm2/bin/pm2';
-        if (!file_exists($pm2bin)) {
-            return;
-        }
-        // generateRunAsAsteriskCommand sets HOME, PM2_HOME, PATH, NODE_PATH and
-        // runs as the asterisk user — the same environment FreePBX PM2 uses.
-        $cmd = $pm2->generateRunAsAsteriskCommand($pm2bin . ' save --force');
-        @exec($cmd . ' 2>/dev/null');
     }
 
     /**
@@ -1924,10 +1913,15 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
         file_put_contents($scriptPath, $scriptContent);
         chmod($scriptPath, 0755);
 
-        // Start via PM2 (force=true so start() deletes any existing entry first)
+        // Start via PM2
         try {
-            \FreePBX::Pm2()->start("convergent-monitoring", $scriptPath, [], true);
-            $this->savePm2Dump();
+            $pm2     = \FreePBX::Pm2();
+            $existing = $pm2->getStatus("convergent-monitoring");
+            if (!empty($existing)) {
+                $pm2->restart("convergent-monitoring");
+            } else {
+                $pm2->start("convergent-monitoring", $scriptPath);
+            }
         } catch (\Exception $e) {
             return ['status' => false, 'message' => 'Failed to start: ' . $e->getMessage()];
         }
