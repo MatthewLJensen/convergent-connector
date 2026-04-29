@@ -19,6 +19,10 @@
         // Store detected credentials for copy-to-settings functionality
         detectedCredentials: null,
 
+        // In-flight service action tracker — prevents duplicate concurrent requests
+        // (FreePBX can surface two click paths for one button press)
+        _pendingActions: {},
+
         // Initialize the module
         init: function() {
             var self = this;
@@ -129,6 +133,12 @@
 
         // Perform service action (start, stop, restart, enable, disable)
         serviceAction: function(action) {
+            // Guard: if a request for this action is already in flight, drop the duplicate
+            if (this._pendingActions[action]) {
+                return;
+            }
+            this._pendingActions[action] = true;
+
             var self = this;
             var $btn = $('.btn-service-action[data-action="' + action + '"]');
             var originalHtml = $btn.html();
@@ -159,6 +169,7 @@
                     self.showResult('danger', 'Request failed: ' + error);
                 },
                 complete: function() {
+                    delete self._pendingActions[action];
                     $btn.prop('disabled', false).html(originalHtml);
                 }
             });
@@ -167,13 +178,13 @@
         // Refresh service status
         refreshStatus: function() {
             var $btn = $('#btn-refresh-status');
-            var originalHtml = $btn.html();
-
             $btn.prop('disabled', true).html('<span class="loading-spinner"></span> Refreshing...');
 
-            // Simply reload the page to get fresh data
+            // Use reloadPage() (window.location.href) instead of location.reload() so the
+            // browser issues a GET rather than replaying FreePBX's previous POST navigation,
+            // which was causing the service action to fire twice.
             setTimeout(function() {
-                location.reload();
+                Convergent.reloadPage();
             }, 500);
         },
 
