@@ -218,6 +218,14 @@ function detectSSLInstallPaths() {
         // Config not available during install
     }
 
+    // Backup default: FreePBX certman "integration" directory, which holds the
+    // active cert in an asterisk-readable form (certificate.pem + webserver.key).
+    $integrationCert = '/etc/asterisk/keys/integration/certificate.pem';
+    $integrationKey  = '/etc/asterisk/keys/integration/webserver.key';
+    if (file_exists($integrationCert) && file_exists($integrationKey)) {
+        return ['cert' => $integrationCert, 'key' => $integrationKey];
+    }
+
     // Fallback: version-based paths
     // Check admin table for version
     global $db;

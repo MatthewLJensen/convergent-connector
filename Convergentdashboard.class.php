@@ -31,6 +31,13 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
     /** GitHub API base for this module's releases */
     private const MODULE_GITHUB_API = 'https://api.github.com/repos/MatthewLJensen/convergent-connector';
 
+    /** Certificate expiry thresholds (days) */
+    private const CERT_WARNING_DAYS  = 30;
+    private const CERT_CRITICAL_DAYS = 7;
+
+    /** Result marker written by hooks/updatecertificates */
+    private const CERT_UPDATE_MARKER = '/tmp/convergent-cert-update.json';
+
     public function install()
     {
         // install() runs as root via fwconsole
@@ -97,6 +104,8 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             'check_prerequisites',
             'setup_service',
             'detect_ssl_paths',
+            'get_certificate_info',
+            'update_certificates',
             'test_hook',
             'download_update',
             'apply_update',
@@ -156,6 +165,12 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
 
             case 'detect_ssl_paths':
                 return $this->detectSSLPaths();
+
+            case 'get_certificate_info':
+                return $this->getCertificateInfo();
+
+            case 'update_certificates':
+                return $this->updateCertificates();
 
             case 'test_hook':
                 return $this->testHook();
@@ -363,7 +378,15 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             // Config not available during install
         }
 
-        // 3. Fallback: version-based paths
+        // 3. Backup default: FreePBX certman "integration" directory, which holds
+        // the active cert in an asterisk-readable form.
+        $integrationCert = '/etc/asterisk/keys/integration/certificate.pem';
+        $integrationKey  = '/etc/asterisk/keys/integration/webserver.key';
+        if (file_exists($integrationCert) && file_exists($integrationKey)) {
+            return ['cert' => $integrationCert, 'key' => $integrationKey];
+        }
+
+        // 4. Fallback: version-based paths
         $version = $this->getFreePBXVersion();
         if ($version && $version >= 17) {
             return [
@@ -407,6 +430,21 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             // Config not available
         }
 
+        // Backup default: FreePBX certman "integration" directory (asterisk-readable).
+        $integrationCert = '/etc/asterisk/keys/integration/certificate.pem';
+        $integrationKey  = '/etc/asterisk/keys/integration/webserver.key';
+        $attempted[] = ['cert' => $integrationCert, 'key' => $integrationKey, 'source' => 'Asterisk integration keys'];
+        if (is_readable($integrationCert) && is_readable($integrationKey)) {
+            $this->setConfigValue('ssl_cert_path', $integrationCert);
+            $this->setConfigValue('ssl_key_path', $integrationKey);
+            return [
+                'status' => true,
+                'message' => 'SSL paths detected from Asterisk integration keys',
+                'cert' => $integrationCert,
+                'key' => $integrationKey,
+            ];
+        }
+
         // Try version-based paths
         $version = $this->getFreePBXVersion();
         if ($version && $version >= 17) {
@@ -438,6 +476,169 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
                 . 'Default paths: ' . $certPath . ', ' . $keyPath . '. '
                 . 'Copy them to an asterisk-readable location or set custom paths in Settings.',
             'attempted' => $attempted,
+        ];
+    }
+
+    /**
+     * Parse the certificate at ssl_cert_path and return display-ready info.
+     * Runs as the asterisk user from the web UI, so is_readable() reflects actual usability.
+     */
+    public function getCertificateInfo()
+    {
+        $path = $this->getConfigValue('ssl_cert_path');
+
+        if (empty($path)) {
+            return [
+                'status'  => false,
+                'code'    => 'not_configured',
+                'message' => 'No SSL certificate path is configured.',
+                'cert'    => ['path' => ''],
+            ];
+        }
+
+        if (!file_exists($path)) {
+            return [
+                'status'  => false,
+                'code'    => 'missing',
+                'message' => 'Certificate file does not exist at the configured path.',
+                'cert'    => ['path' => $path],
+            ];
+        }
+
+        if (!is_readable($path)) {
+            return [
+                'status'  => false,
+                'code'    => 'unreadable',
+                'message' => 'Certificate file exists but is not readable by the asterisk user.',
+                'cert'    => ['path' => $path],
+            ];
+        }
+
+        $pem = @file_get_contents($path);
+        if ($pem === false || $pem === '') {
+            return [
+                'status'  => false,
+                'code'    => 'unreadable',
+                'message' => 'Certificate file could not be read.',
+                'cert'    => ['path' => $path],
+            ];
+        }
+
+        $parsed = @openssl_x509_parse($pem);
+        if ($parsed === false || !is_array($parsed)) {
+            return [
+                'status'  => false,
+                'code'    => 'unparseable',
+                'message' => 'Certificate file could not be parsed as PEM.',
+                'cert'    => ['path' => $path],
+            ];
+        }
+
+        $subjectCn = $parsed['subject']['CN'] ?? '';
+        $issuerCn  = $parsed['issuer']['CN']  ?? '';
+        $validFrom = $parsed['validFrom_time_t'] ?? 0;
+        $validTo   = $parsed['validTo_time_t']   ?? 0;
+
+        $daysUntilExpiry = (int) floor(($validTo - time()) / 86400);
+
+        if ($daysUntilExpiry < 0) {
+            $expiryStatus = 'expired';
+        } elseif ($daysUntilExpiry <= self::CERT_CRITICAL_DAYS) {
+            $expiryStatus = 'critical';
+        } elseif ($daysUntilExpiry <= self::CERT_WARNING_DAYS) {
+            $expiryStatus = 'warning';
+        } else {
+            $expiryStatus = 'ok';
+        }
+
+        // Subject Alt Names — split, trim DNS: prefix
+        $sans = [];
+        $sanRaw = $parsed['extensions']['subjectAltName'] ?? '';
+        if (!empty($sanRaw)) {
+            foreach (explode(',', $sanRaw) as $entry) {
+                $entry = trim($entry);
+                if (strpos($entry, 'DNS:') === 0) {
+                    $entry = substr($entry, 4);
+                }
+                if ($entry !== '') {
+                    $sans[] = $entry;
+                }
+            }
+        }
+
+        $isLetsEncrypt = (bool) preg_match('/Let\'s Encrypt|^R\d+$|^E\d+$/', $issuerCn);
+        $selfSigned    = ($parsed['subject'] ?? null) === ($parsed['issuer'] ?? null);
+
+        return [
+            'status' => true,
+            'cert' => [
+                'path'              => $path,
+                'subject_cn'        => $subjectCn,
+                'issuer_cn'         => $issuerCn,
+                'is_lets_encrypt'   => $isLetsEncrypt,
+                'self_signed'       => $selfSigned,
+                'valid_from'        => $validFrom ? date('Y-m-d H:i:s T', $validFrom) : '',
+                'valid_to'          => $validTo   ? date('Y-m-d H:i:s T', $validTo)   : '',
+                'days_until_expiry' => $daysUntilExpiry,
+                'expiry_status'     => $expiryStatus,
+                'sans'              => $sans,
+                'serial'            => $parsed['serialNumber'] ?? '',
+            ],
+        ];
+    }
+
+    /**
+     * Trigger `fwconsole certificates --updateall` via the root incron hook.
+     * Reads the marker file written by hooks/updatecertificates to surface
+     * fwconsole output back to the caller.
+     */
+    public function updateCertificates()
+    {
+        // Clear stale marker so we don't read a previous run's result
+        if (file_exists(self::CERT_UPDATE_MARKER)) {
+            @unlink(self::CERT_UPDATE_MARKER);
+        }
+
+        $hookOk = $this->runHook('updatecertificates', false, 180);
+
+        if (!$hookOk) {
+            return [
+                'status'  => false,
+                'message' => 'Certificate update timed out after 180 seconds. '
+                    . 'It may still be running — check /tmp/convergent-updatecertificates.log on the server.',
+            ];
+        }
+
+        if (!file_exists(self::CERT_UPDATE_MARKER)) {
+            return [
+                'status'  => false,
+                'message' => 'Certificate update hook completed but did not write a result marker. '
+                    . 'Check /tmp/convergent-updatecertificates.log on the server.',
+            ];
+        }
+
+        $raw = @file_get_contents(self::CERT_UPDATE_MARKER);
+        $marker = @json_decode($raw, true);
+
+        if (!is_array($marker)) {
+            return [
+                'status'  => false,
+                'message' => 'Could not parse certificate update result.',
+                'raw'     => $raw,
+            ];
+        }
+
+        $exitCode = isset($marker['exit_code']) ? (int) $marker['exit_code'] : 1;
+        $success  = ($exitCode === 0);
+
+        return [
+            'status'    => $success,
+            'message'   => $marker['message'] ?? ($success
+                ? 'Certificate update completed successfully.'
+                : 'Certificate update finished with exit code ' . $exitCode . '.'),
+            'exit_code' => $exitCode,
+            'output'    => $marker['output']   ?? '',
+            'duration'  => $marker['duration'] ?? 0,
         ];
     }
 
@@ -1044,6 +1245,9 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
         $gqlCreds = $this->getGraphQLCredentials();
         $credentials['graphql'] = $gqlCreds;
 
+        // Get resolved SSL cert/key paths (config -> Advanced Settings -> integration -> version-based)
+        $credentials['ssl'] = $this->getSSLSourcePaths();
+
         return ['status' => true, 'credentials' => $credentials];
     }
 
@@ -1289,46 +1493,51 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
         $lines = min(max($lines, 10), 1000);
         $status = \FreePBX::Pm2()->getStatus("convergent-monitoring");
 
-        $logContent = '';
-
+        $logPaths = [];
         if ($status) {
             $outLog = $status['pm2_env']['pm_out_log_path'] ?? '';
             $errLog = $status['pm2_env']['pm_err_log_path'] ?? '';
-
-            $logLines = [];
-            foreach ([$outLog, $errLog] as $logFile) {
-                if (!empty($logFile) && file_exists($logFile)) {
-                    $allLines = file($logFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-                    if ($allLines) {
-                        $logLines = array_merge($logLines, $allLines);
-                    }
-                }
-            }
-
-            $logLines = array_slice($logLines, -$lines);
-            $logContent = implode("\n", $logLines);
+            if (!empty($outLog)) { $logPaths[] = $outLog; }
+            if (!empty($errLog)) { $logPaths[] = $errLog; }
         }
+
+        $logContent = $this->tailLogFiles($logPaths, $lines);
 
         // Fallback: try known pm2 log paths
         if (empty($logContent)) {
-            $fallbackPaths = [
+            $logContent = $this->tailLogFiles([
                 '/var/log/asterisk/convergent-monitoring_out.log',
                 '/var/log/asterisk/convergent-monitoring_err.log',
-            ];
-            foreach ($fallbackPaths as $path) {
-                if (file_exists($path)) {
-                    $allLines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-                    if ($allLines) {
-                        $logContent .= implode("\n", array_slice($allLines, -$lines)) . "\n";
-                    }
-                }
-            }
+            ], $lines);
         }
 
         return [
             'status' => !empty($logContent),
             'logs' => $logContent ?: 'No logs available. The service may not have been started yet.'
         ];
+    }
+
+    /**
+     * Read the last $lines lines from a set of log files without loading them
+     * fully into memory. Shells out to `tail` so memory usage stays bounded
+     * regardless of log size (otherwise file() can exhaust PHP's memory_limit
+     * on long-running installs with multi-hundred-MB pm2 logs).
+     */
+    private function tailLogFiles(array $paths, $lines)
+    {
+        $existing = array_filter($paths, 'file_exists');
+        if (empty($existing)) {
+            return '';
+        }
+
+        $cmd = 'tail -n ' . (int)$lines;
+        foreach ($existing as $path) {
+            $cmd .= ' ' . escapeshellarg($path);
+        }
+        $cmd .= ' 2>/dev/null';
+
+        $output = @shell_exec($cmd);
+        return $output !== null ? rtrim($output, "\n") : '';
     }
 
     /**

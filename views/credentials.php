@@ -86,6 +86,9 @@ $keyReadable  = is_readable($sslPaths['key']);
         </div>
         <?php endif; ?>
 
+        <button type="button" class="btn btn-primary btn-copy-to-settings" data-type="ssl">
+            <i class="fa fa-copy"></i> Copy to Settings
+        </button>
         <button type="button" class="btn btn-default" id="btn-redetect-ssl">
             <i class="fa fa-search"></i> Redetect SSL Paths
         </button>

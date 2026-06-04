@@ -19,11 +19,13 @@ $moduleVersion = $convergent->getModuleVersion();
 
 // Only run expensive checks on the status tab
 if ($activeTab === 'status') {
-    $serviceStatus = $convergent->getServiceStatus();
-    $prerequisites = $convergent->checkPrerequisites();
+    $serviceStatus   = $convergent->getServiceStatus();
+    $prerequisites   = $convergent->checkPrerequisites();
+    $certificateInfo = $convergent->getCertificateInfo();
 } else {
-    $serviceStatus = ['service' => []];
-    $prerequisites = ['prerequisites' => [], 'all_ready' => false, 'can_setup' => false];
+    $serviceStatus   = ['service' => []];
+    $prerequisites   = ['prerequisites' => [], 'all_ready' => false, 'can_setup' => false];
+    $certificateInfo = ['status' => false, 'code' => 'not_configured', 'cert' => ['path' => '']];
 }
 
 // Get success/error messages from form submissions

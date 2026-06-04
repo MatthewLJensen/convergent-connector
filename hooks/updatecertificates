@@ -1,0 +1,89 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Convergent Dashboard - Update Certificates Hook
+ * Runs as root via sysadmin/incron
+ *
+ * Runs `fwconsole certificates --updateall` to renew Let's Encrypt
+ * (and any other certman-managed) certificates, then writes a result
+ * marker file the PHP side can surface back to the user.
+ *
+ * Log file:    /tmp/convergent-updatecertificates.log
+ * Marker file: /tmp/convergent-cert-update.json
+ */
+
+$logFile    = '/tmp/convergent-updatecertificates.log';
+$markerFile = '/tmp/convergent-cert-update.json';
+$fwconsole  = '/usr/sbin/fwconsole';
+
+function logMsg($msg) {
+    global $logFile;
+    file_put_contents($logFile, "[" . date('Y-m-d H:i:s') . "] {$msg}\n", FILE_APPEND);
+    error_log("convergentdashboard updatecertificates: $msg");
+}
+
+function writeMarker($exitCode, $output, $duration, $message) {
+    global $markerFile;
+    // Cap output at ~8KB so a chatty fwconsole run doesn't blow up the JSON
+    if (strlen($output) > 8192) {
+        $output = "... (truncated) ...\n" . substr($output, -8192);
+    }
+    $marker = [
+        'timestamp' => date('c'),
+        'exit_code' => (int) $exitCode,
+        'output'    => $output,
+        'duration'  => round($duration, 2),
+        'message'   => $message,
+    ];
+    file_put_contents($markerFile, json_encode($marker, JSON_PRETTY_PRINT) . "\n");
+    @chmod($markerFile, 0644);
+}
+
+// Fresh log for this run
+file_put_contents($logFile, "");
+logMsg("=== Update Certificates Hook Started ===");
+logMsg("Running as uid=" . posix_getuid() . " (" . (posix_getpwuid(posix_getuid())['name'] ?? '?') . ")");
+
+// Clean up any trigger files for this hook
+$spoolDir = '/var/spool/asterisk/incron';
+$triggerFiles = glob("$spoolDir/convergentdashboard.updatecertificates*");
+logMsg("Found " . count($triggerFiles) . " trigger file(s)");
+foreach ($triggerFiles as $tf) {
+    logMsg("Removing trigger: " . basename($tf));
+    @unlink($tf);
+}
+
+// Guard: fwconsole must be present
+if (!file_exists($fwconsole)) {
+    logMsg("ERROR: fwconsole not found at $fwconsole");
+    writeMarker(127, "fwconsole not found at $fwconsole", 0, "fwconsole binary missing");
+    exit(127);
+}
+
+$cmd = "timeout 150 " . escapeshellarg($fwconsole) . " certificates --updateall 2>&1";
+logMsg("RUN: $cmd");
+
+$start = microtime(true);
+$output = [];
+$exitCode = 0;
+exec($cmd, $output, $exitCode);
+$duration = microtime(true) - $start;
+
+$outputStr = implode("\n", $output);
+logMsg("Exit code: $exitCode (duration: " . round($duration, 2) . "s)");
+if ($outputStr !== '') {
+    logMsg("Output:\n$outputStr");
+}
+
+if ($exitCode === 0) {
+    $message = "Certificate update completed successfully.";
+} elseif ($exitCode === 124) {
+    // GNU timeout(1) exit code when the wrapped command is killed for taking too long
+    $message = "fwconsole certificates --updateall exceeded the 150s internal timeout.";
+} else {
+    $message = "fwconsole certificates --updateall exited with code $exitCode.";
+}
+
+writeMarker($exitCode, $outputStr, $duration, $message);
+logMsg("=== Update Certificates Hook Finished ===");
+exit($exitCode);

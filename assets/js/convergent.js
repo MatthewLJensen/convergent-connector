@@ -112,6 +112,12 @@
             $('#btn-check-module-update').off('click.cvg').on('click.cvg', function() {
                 self.checkModuleUpdate();
             });
+            $('#btn-update-certificates').off('click.cvg').on('click.cvg', function() {
+                self.updateCertificates();
+            });
+            $('#btn-refresh-cert-info').off('click.cvg').on('click.cvg', function() {
+                self.reloadPage();
+            });
         },
 
         // Initialize password toggle buttons
@@ -349,6 +355,61 @@
             });
         },
 
+        // Trigger fwconsole certificates --updateall via the root hook
+        updateCertificates: function() {
+            if (this._pendingActions['updateCerts']) {
+                return;
+            }
+            this._pendingActions['updateCerts'] = true;
+
+            var self = this;
+            var $btn = $('#btn-update-certificates');
+            var $result = $('#cert-action-result');
+            var originalHtml = $btn.html();
+
+            $btn.prop('disabled', true).html('<span class="loading-spinner"></span> Renewing — this may take a few minutes...');
+            $result.removeClass().addClass('alert alert-info').html(
+                '<i class="fa fa-spinner fa-spin"></i> Running fwconsole certificates --updateall. Please wait...'
+            ).fadeIn();
+
+            $.ajax({
+                url: 'ajax.php',
+                type: 'POST',
+                dataType: 'json',
+                // Must exceed the server-side runHook() 180s timeout
+                timeout: 200000,
+                data: {
+                    module: 'convergentdashboard',
+                    command: 'update_certificates'
+                },
+                success: function(response) {
+                    var html = '<strong>' + self.escapeHtml(response.message || '') + '</strong>';
+                    if (response.output) {
+                        html += '<pre style="max-height:300px;overflow:auto;margin-top:8px;">'
+                              + self.escapeHtml(response.output) + '</pre>';
+                    }
+                    if (response.status) {
+                        html += '<em>Reloading to refresh certificate info...</em>';
+                        $result.removeClass().addClass('alert alert-success').html(html);
+                        setTimeout(function() { self.reloadPage(); }, 3000);
+                    } else {
+                        $result.removeClass().addClass('alert alert-danger').html(html);
+                    }
+                },
+                error: function(xhr, status, error) {
+                    $result.removeClass().addClass('alert alert-danger').html(
+                        '<strong>Request failed:</strong> ' + self.escapeHtml(error)
+                        + '<br><small class="text-muted">The renewal may still be running on the server. '
+                        + 'Check /tmp/convergent-updatecertificates.log, then refresh this page.</small>'
+                    );
+                },
+                complete: function() {
+                    delete self._pendingActions['updateCerts'];
+                    $btn.prop('disabled', false).html(originalHtml);
+                }
+            });
+        },
+
         // Auto-detect credentials for a specific type and update form fields
         autoDetectCredentials: function(type) {
             var self = this;
@@ -434,6 +495,9 @@
                 $('#gql_token_url').val(credentials.graphql.token_url || '');
                 $('#gql_client_id').val(credentials.graphql.client_id || '');
                 $('#gql_client_secret').val(credentials.graphql.client_secret || '');
+            } else if (type === 'ssl' && credentials.ssl) {
+                $('#ssl_cert_path').val(credentials.ssl.cert || '');
+                $('#ssl_key_path').val(credentials.ssl.key || '');
             }
         },
 
@@ -492,6 +556,7 @@
                             self.fillCredentialFields('ami', response.credentials);
                             self.fillCredentialFields('ari', response.credentials);
                             self.fillCredentialFields('graphql', response.credentials);
+                            self.fillCredentialFields('ssl', response.credentials);
                             self.showSettingsResult('success', 'All detected credentials copied. Click "Save Settings" to save.');
                         }, 300);
                     } else {
