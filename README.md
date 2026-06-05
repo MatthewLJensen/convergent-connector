@@ -25,11 +25,26 @@ fwconsole reload
 
 ## Upgrading
 
+The easiest path is the **"Check for Updates" → "Install"** button on the Status
+tab, which downloads the latest GitHub release, overlays the files, and registers
+the new version for you.
+
+To upgrade manually from a shell:
+
 ```bash
 cd /var/www/html/admin/modules/convergentdashboard
 git pull origin main
+fwconsole ma install convergentdashboard --force
 fwconsole reload
 ```
+
+> **Note:** `fwconsole ma install convergentdashboard` is required after changing
+> the files. FreePBX tracks the installed version in its database; if the on-disk
+> `module.xml` version is newer than the recorded one, the module is flagged
+> "Pending Upgrade" and disabled until `install` (or a Module Admin upgrade)
+> registers the new version. A bare `git pull` + `fwconsole reload` is not enough.
+> (`ma install <module>` runs the local files already on disk — it does not
+> download from a repo, so it works for this unsigned module.)
 
 ## Configuration
 

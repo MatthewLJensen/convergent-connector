@@ -221,6 +221,35 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
         return ['status' => false, 'message' => 'Failed to save configuration'];
     }
 
+    /**
+     * Insert-or-update a single convergent_config key.
+     *
+     * Unlike setConfigValue() (a plain UPDATE that silently no-ops when the
+     * row is missing), this guarantees the row exists afterwards. Required for
+     * keys whose *empty string* is meaningful — e.g. an empty `restart_schedule`
+     * disables the scheduled restart, which must persist as a stored empty value
+     * rather than an absent row (absent falls back to the Node-side default).
+     */
+    private function upsertConfigValue($key, $value)
+    {
+        $sql = "INSERT INTO `convergent_config` (`key`, `value`) VALUES (?, ?)
+                ON DUPLICATE KEY UPDATE `value` = ?";
+        $stmt = $this->db->prepare($sql);
+        return $stmt->execute([$key, $value, $value]);
+    }
+
+    /**
+     * Stash a one-shot message for page.convergentdashboard.php to render on the
+     * next render of this request (it reads and clears $_SESSION on load).
+     */
+    private function setSessionMessage($message, $type = 'info')
+    {
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            $_SESSION['convergent_message'] = $message;
+            $_SESSION['convergent_message_type'] = $type;
+        }
+    }
+
     public function getAllConfig()
     {
         $sql = "SELECT `key`, `value`, `description` FROM `convergent_config`";
@@ -265,10 +294,109 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             }
         }
 
-        // Send SIGHUP to refresh config in running service
+        // Scheduled-restart settings are validated and upserted separately:
+        // their values can legitimately be empty, and an empty value must be
+        // stored (not skipped) to convey "disabled"/"host local time".
+        $errors = $this->saveRestartSettings($data);
+
+        // Send SIGHUP to refresh config in running service. Note: the running
+        // service re-reads AMI/ARI/dashboard config on SIGHUP but does NOT
+        // re-arm the cron job — restart_* changes only take effect on the next
+        // process start (which the next scheduled restart, or a manual restart,
+        // will pick up). Hence the notice below.
         $this->signalConfigRefresh();
 
+        if (!empty($errors)) {
+            $msg = 'Settings saved, but some scheduled-restart values were rejected: '
+                . implode(' ', $errors);
+            $this->setSessionMessage($msg, 'warning');
+            return ['status' => false, 'message' => $msg, 'errors' => $errors];
+        }
+
+        $this->setSessionMessage(
+            'Settings saved. Scheduled-restart changes take effect after the next service '
+            . 'restart (or immediately if you restart the monitoring service now).',
+            'success'
+        );
+
         return ['status' => true, 'message' => 'Settings saved successfully'];
+    }
+
+    /**
+     * Validate and persist the three scheduled-restart config keys.
+     *
+     * Only acts on keys actually present in $data, so it is safe to call from
+     * any save path. Returns an array of human-readable error strings for any
+     * field that failed validation (those fields are left unchanged); valid
+     * fields are written via upsert. The Node service consumes these at startup.
+     *
+     * @return string[] validation errors (empty array = all good)
+     */
+    private function saveRestartSettings($data)
+    {
+        $errors = [];
+
+        // restart_schedule — empty string disables; otherwise must be a 5-field
+        // cron expression (croner on the Node side uses standard 5 fields).
+        if (isset($data['restart_schedule'])) {
+            $schedule = trim($data['restart_schedule']);
+            if ($schedule !== '' && !preg_match('/^\S+(\s+\S+){4}$/', $schedule)) {
+                $errors[] = 'Cron expression must have 5 fields, e.g. "0 4 * * *".';
+            } else {
+                $this->upsertConfigValue('restart_schedule', $schedule);
+            }
+        }
+
+        // restart_drain_timeout_seconds — integer, clamped to a sane 10–600s.
+        if (isset($data['restart_drain_timeout_seconds'])) {
+            $raw = trim($data['restart_drain_timeout_seconds']);
+            if ($raw === '' || !preg_match('/^\d+$/', $raw)) {
+                $errors[] = 'Drain timeout must be a whole number of seconds.';
+            } else {
+                $clamped = max(10, min(600, (int)$raw));
+                $this->upsertConfigValue('restart_drain_timeout_seconds', (string)$clamped);
+            }
+        }
+
+        // restart_timezone — empty = host local time; otherwise must be a known
+        // IANA zone so a typo doesn't silently fall back to local time.
+        if (isset($data['restart_timezone'])) {
+            $tz = trim($data['restart_timezone']);
+            if ($tz !== '' && !in_array($tz, timezone_identifiers_list(), true)) {
+                $errors[] = 'Unknown timezone; use an IANA name like "America/Denver".';
+            } else {
+                $this->upsertConfigValue('restart_timezone', $tz);
+            }
+        }
+
+        return $errors;
+    }
+
+    /**
+     * Compute the next scheduled-restart time for display, if a cron library
+     * is available. Returns '' when no schedule is set, the schedule is invalid,
+     * or no cron library is vendored — callers should treat '' as "no preview".
+     * Does not depend on the Node service being up.
+     */
+    public function getNextRestartPreview()
+    {
+        $schedule = $this->getConfigValue('restart_schedule');
+        if ($schedule === null) {
+            $schedule = '0 4 * * *'; // matches the Node-side default
+        }
+        $schedule = trim($schedule);
+        if ($schedule === '' || !class_exists('Cron\\CronExpression')) {
+            return '';
+        }
+
+        $tz = trim((string)($this->getConfigValue('restart_timezone') ?? ''));
+        try {
+            $tzObj = new \DateTimeZone($tz !== '' ? $tz : date_default_timezone_get());
+            $cron  = new \Cron\CronExpression($schedule);
+            return $cron->getNextRunDate(new \DateTime('now', $tzObj))->format('Y-m-d H:i:s T');
+        } catch (\Exception $e) {
+            return '';
+        }
     }
 
     /**
@@ -1486,11 +1614,34 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
     }
 
     /**
-     * Get PM2 logs for the service
+     * Get service logs for display.
+     *
+     * Prefers the rotating log the Node service now writes
+     * (/var/log/asterisk/convergent-monitoring.log) — plain "[ISO-8601] message",
+     * one entry per line, capped at ~10 MB live by rotation. Falls back to pm2's
+     * stdout/stderr capture files for hosts that haven't taken the Node update.
+     *
+     * Always reads only the tail (via tailLogFiles -> `tail`) so memory stays
+     * bounded regardless of file size — file()/file_get_contents() on the whole
+     * file is what caused the original out-of-memory incident.
      */
     public function getJournalLogs($lines = 100)
     {
         $lines = min(max($lines, 10), 1000);
+
+        // Preferred: the new rotating log. Match the exact filename so we never
+        // pick up rotating-file-stream's "convergent-monitoring.log.txt"
+        // bookkeeping file sitting next to it.
+        $rotatingLog = '/var/log/asterisk/convergent-monitoring.log';
+        if (is_readable($rotatingLog)) {
+            $logContent = $this->tailLogFiles([$rotatingLog], $lines);
+            return [
+                'status' => !empty($logContent),
+                'logs' => $logContent ?: 'Log file is present but currently empty.'
+            ];
+        }
+
+        // Fallback: pm2 stdout/stderr capture paths (pre-rotating-log hosts).
         $status = \FreePBX::Pm2()->getStatus("convergent-monitoring");
 
         $logPaths = [];
@@ -1503,7 +1654,7 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
 
         $logContent = $this->tailLogFiles($logPaths, $lines);
 
-        // Fallback: try known pm2 log paths
+        // Last resort: known default pm2 log paths.
         if (empty($logContent)) {
             $logContent = $this->tailLogFiles([
                 '/var/log/asterisk/convergent-monitoring_out.log',
@@ -1620,7 +1771,19 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
     }
 
     /**
-     * Download a GitHub zipball and install it via the installmodule root hook
+     * Download a GitHub release zipball and install it as this module, in-process,
+     * as the web user (asterisk) — no sysadmin/incron signed-hook dispatch required,
+     * so it works on an unsigned module.
+     *
+     * Steps:
+     *   1. Download the zipball to /tmp.
+     *   2. Extract it and overlay the files onto this module's own directory
+     *      (which the web user already owns, so no root is needed).
+     *   3. Register the new version with `fwconsole ma install`, which runs
+     *      install.php (idempotent here) and bumps the version stored in the
+     *      `modules` table to match module.xml. Skipping this is what leaves the
+     *      module flagged "Pending Upgrade" — and disabled — after a bare file swap.
+     *   4. Fire `fwconsole reload` in the background to apply config.
      */
     public function downloadInstallModule($tagName, $zipballUrl)
     {
@@ -1628,9 +1791,11 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             return ['status' => false, 'message' => 'Tag name and download URL are required'];
         }
 
-        $safeTag  = preg_replace('/[^a-zA-Z0-9._-]/', '', $tagName);
-        $destFile = "/tmp/convergentdashboard-{$safeTag}.zip";
+        $modulePath = __DIR__;
+        $safeTag    = preg_replace('/[^a-zA-Z0-9._-]/', '', $tagName);
+        $destFile   = "/tmp/convergentdashboard-{$safeTag}.zip";
 
+        // --- 1. Download the zipball ---------------------------------------
         freepbx_log(FPBX_LOG_NOTICE, "Convergent downloadInstallModule: downloading {$tagName}");
 
         $fp = fopen($destFile, 'w');
@@ -1661,33 +1826,232 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             return ['status' => false, 'message' => "Download failed (HTTP {$httpCode}): {$curlError}"];
         }
 
-        $fileSize = filesize($destFile);
-        if ($fileSize < 1024) {
+        if (filesize($destFile) < 1024) {
             @unlink($destFile);
             return ['status' => false, 'message' => 'Downloaded file is too small — likely an error response'];
         }
 
-        freepbx_log(FPBX_LOG_NOTICE, "Convergent downloadInstallModule: {$fileSize} bytes downloaded, triggering install hook");
+        // --- 2. Extract and overlay the files onto the live module dir -----
+        $extractDir = "/tmp/convergent-module-extract-" . getmypid();
+        $this->rrmdir($extractDir);
+        if (!@mkdir($extractDir, 0755, true)) {
+            @unlink($destFile);
+            return ['status' => false, 'message' => "Could not create temp extract dir {$extractDir}"];
+        }
 
-        $hookResult = $this->runHook('installmodule', [
-            'file'        => $destFile,
-            'module_path' => __DIR__,
-        ], 60);
-
+        $unz = $this->extractZip($destFile, $extractDir);
         @unlink($destFile);
+        if (!$unz['status']) {
+            $this->rrmdir($extractDir);
+            return $unz;
+        }
 
-        if (!$hookResult) {
+        // GitHub zipballs contain exactly one top-level directory.
+        $entries = array_values(array_filter(
+            scandir($extractDir) ?: [],
+            function ($e) { return $e !== '.' && $e !== '..'; }
+        ));
+        if (count($entries) !== 1 || !is_dir("{$extractDir}/{$entries[0]}")) {
+            $this->rrmdir($extractDir);
+            return ['status' => false, 'message' => 'Unexpected archive layout: ' . implode(', ', $entries)];
+        }
+        $sourceDir = "{$extractDir}/{$entries[0]}";
+
+        $copy = $this->recursiveCopy($sourceDir, $modulePath);
+        $this->rrmdir($extractDir);
+        if (!$copy['status']) {
+            return $copy;
+        }
+
+        freepbx_log(FPBX_LOG_NOTICE, "Convergent downloadInstallModule: {$tagName} files copied into {$modulePath}");
+
+        // --- 3 & 4. Register the new version, then reload in the background -
+        return $this->registerModuleUpgrade($tagName);
+    }
+
+    /**
+     * Register the on-disk module version with FreePBX so it isn't flagged
+     * "Pending Upgrade" (and disabled). Runs `fwconsole ma install` for this
+     * module synchronously so we can report exactly what happened — this doubles
+     * as the empirical test of whether fwconsole is runnable as the web user —
+     * then fires `fwconsole reload` in the background so we don't hold the HTTP
+     * request open for a full reload.
+     */
+    private function registerModuleUpgrade($tagName)
+    {
+        $whoami = posix_getpwuid(posix_getuid())['name'] ?? trim((string) @shell_exec('whoami'));
+        $manual = 'fwconsole ma install convergentdashboard --force && fwconsole reload';
+
+        $fw = $this->findFwconsole();
+        if (empty($fw)) {
             return [
-                'status'  => false,
-                'message' => 'Module downloaded but the installation hook timed out. '
-                    . 'Check /tmp/convergent-installmodule.log for details.',
+                'status'     => false,
+                'registered' => false,
+                'ran_as'     => $whoami,
+                'message'    => "Files for {$tagName} were copied into place, but fwconsole could not be found to "
+                    . "register the new version, so the module will show as \"Pending Upgrade\" until you SSH in "
+                    . "and run:  {$manual}",
             ];
         }
 
+        // `ma install <module>` runs install.php (idempotent here) for the
+        // already-on-disk files and sets the modules-table version = module.xml
+        // version (no repo download). --force smooths over dependency edge cases.
+        $install = $this->execCapture(escapeshellarg($fw) . ' ma install convergentdashboard --force', 150);
+
+        if ($install['code'] !== 0) {
+            freepbx_log(FPBX_LOG_ERROR, "Convergent registerModuleUpgrade: ma install exit {$install['code']} (user={$whoami})");
+            return [
+                'status'     => false,
+                'registered' => false,
+                'ran_as'     => $whoami,
+                'exit_code'  => $install['code'],
+                'output'     => $this->tailString($install['output'], 4000),
+                'message'    => "New files are in place, but registering the version failed "
+                    . "(fwconsole exited {$install['code']}, ran as '{$whoami}'). The module may show as "
+                    . "\"Pending Upgrade\" until resolved — try manually:  {$manual}",
+            ];
+        }
+
+        // Apply config in the background; a full reload is too slow to hold the
+        // request open, and the GUI already runs the new version after the install.
+        $reloadLog = '/tmp/convergent-modulereload.log';
+        @exec('nohup ' . escapeshellarg($fw) . ' reload >> ' . escapeshellarg($reloadLog) . ' 2>&1 &');
+
+        freepbx_log(FPBX_LOG_NOTICE, "Convergent registerModuleUpgrade: registered {$tagName} via ma install (user={$whoami})");
+
         return [
-            'status'  => true,
-            'message' => "Module updated to {$tagName}. Reloading...",
+            'status'     => true,
+            'registered' => true,
+            'ran_as'     => $whoami,
+            'output'     => $this->tailString($install['output'], 4000),
+            'message'    => "Module updated to {$tagName} and registered. Applying configuration in the background…",
         ];
+    }
+
+    /**
+     * Locate the fwconsole binary. Returns '' if not found.
+     */
+    private function findFwconsole()
+    {
+        foreach (['/usr/sbin/fwconsole', '/usr/local/sbin/fwconsole'] as $candidate) {
+            if (is_file($candidate) && is_executable($candidate)) {
+                return $candidate;
+            }
+        }
+        $which = trim((string) @shell_exec('command -v fwconsole 2>/dev/null'));
+        return ($which !== '' && is_file($which)) ? $which : '';
+    }
+
+    /**
+     * Run a shell command with a hard timeout, capturing combined output and the
+     * exit code. Relies on coreutils `timeout`, as the cert update hook does.
+     */
+    private function execCapture($cmd, $timeoutSec = 120)
+    {
+        $output = [];
+        $code   = 0;
+        exec('timeout ' . (int) $timeoutSec . ' ' . $cmd . ' 2>&1', $output, $code);
+        return ['code' => $code, 'output' => implode("\n", $output)];
+    }
+
+    /**
+     * Extract a zip archive, preferring the bundled ZipArchive extension and
+     * falling back to the `unzip` binary.
+     */
+    private function extractZip($zipFile, $destDir)
+    {
+        if (class_exists('\ZipArchive')) {
+            $zip    = new \ZipArchive();
+            $opened = $zip->open($zipFile);
+            if ($opened !== true) {
+                return ['status' => false, 'message' => "Could not open zip (ZipArchive error {$opened})"];
+            }
+            $ok = $zip->extractTo($destDir);
+            $zip->close();
+            if (!$ok) {
+                return ['status' => false, 'message' => 'ZipArchive failed to extract the archive'];
+            }
+            return ['status' => true];
+        }
+
+        $res = $this->execCapture('unzip -q ' . escapeshellarg($zipFile) . ' -d ' . escapeshellarg($destDir), 120);
+        if ($res['code'] !== 0) {
+            return ['status' => false, 'message' => 'unzip failed: ' . $this->tailString($res['output'], 1000)];
+        }
+        return ['status' => true];
+    }
+
+    /**
+     * Recursively copy the contents of $src into $dst, overlaying existing files
+     * (matching the old `cp -a source/. dest/` behavior). Files removed in the new
+     * release are left in place rather than deleted.
+     */
+    private function recursiveCopy($src, $dst)
+    {
+        if (!is_dir($dst) && !@mkdir($dst, 0755, true)) {
+            return ['status' => false, 'message' => "Could not create destination dir {$dst}"];
+        }
+
+        $items = scandir($src);
+        if ($items === false) {
+            return ['status' => false, 'message' => "Could not read source dir {$src}"];
+        }
+
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $from = "{$src}/{$item}";
+            $to   = "{$dst}/{$item}";
+
+            if (is_dir($from)) {
+                $sub = $this->recursiveCopy($from, $to);
+                if (!$sub['status']) {
+                    return $sub;
+                }
+            } elseif (!@copy($from, $to)) {
+                return ['status' => false, 'message' => "Failed to copy {$item} into the module directory"];
+            } else {
+                @chmod($to, fileperms($from) & 0777);
+            }
+        }
+
+        return ['status' => true];
+    }
+
+    /**
+     * Recursively delete a directory. Best-effort.
+     */
+    private function rrmdir($dir)
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        foreach (scandir($dir) ?: [] as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $path = "{$dir}/{$item}";
+            if (is_dir($path)) {
+                $this->rrmdir($path);
+            } else {
+                @unlink($path);
+            }
+        }
+        @rmdir($dir);
+    }
+
+    /**
+     * Return at most the last $maxBytes of a string, prefixed with a marker when
+     * truncated — keeps fwconsole output from bloating an AJAX response.
+     */
+    private function tailString($str, $maxBytes = 4000)
+    {
+        if (strlen($str) <= $maxBytes) {
+            return $str;
+        }
+        return "… (truncated) …\n" . substr($str, -$maxBytes);
     }
 
     /**

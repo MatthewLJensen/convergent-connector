@@ -116,6 +116,77 @@ $cfg = $config['config'] ?? [];
         </div>
     </div>
 
+    <!-- Scheduled Restart -->
+    <?php
+        // Defaults mirror the Node-side defaults. Use ?? (not ?:) so a stored
+        // empty string — which intentionally disables the schedule / means host
+        // local time — survives instead of being replaced by the default.
+        $restartSchedule = $cfg['restart_schedule']['value'] ?? '0 4 * * *';
+        $restartDrain    = $cfg['restart_drain_timeout_seconds']['value'] ?? '120';
+        $restartTz       = $cfg['restart_timezone']['value'] ?? '';
+        $nextRestart     = method_exists($convergent ?? null, 'getNextRestartPreview')
+            ? $convergent->getNextRestartPreview()
+            : '';
+    ?>
+    <div class="panel panel-default">
+        <div class="panel-heading">
+            <h3 class="panel-title"><i class="fa fa-refresh"></i> Scheduled Restart</h3>
+        </div>
+        <div class="panel-body">
+            <div class="alert alert-info">
+                <i class="fa fa-info-circle"></i>
+                The monitoring service can recycle itself on a schedule, draining active calls first.
+                These values are read by the service <strong>at startup</strong> — a saved change applies
+                after the next service restart (use <em>Save &amp; Restart Service</em> below to apply now).
+            </div>
+            <div class="row">
+                <div class="col-md-5">
+                    <div class="form-group">
+                        <label for="restart_schedule">Restart Schedule (cron)</label>
+                        <input type="text" class="form-control" id="restart_schedule" name="restart_schedule"
+                               value="<?php echo htmlspecialchars($restartSchedule); ?>"
+                               placeholder="0 4 * * *">
+                        <p class="help-block">
+                            5-field cron (min hour day-of-month month day-of-week), evaluated in the timezone
+                            below. Leave blank to disable scheduled restarts. Example:
+                            <code>0 4 * * *</code> = 4:00 AM daily.
+                        </p>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="form-group">
+                        <label for="restart_drain_timeout_seconds">Drain Timeout (seconds)</label>
+                        <input type="number" class="form-control" id="restart_drain_timeout_seconds"
+                               name="restart_drain_timeout_seconds"
+                               value="<?php echo htmlspecialchars($restartDrain); ?>"
+                               min="10" max="600">
+                        <p class="help-block">How long to let in-progress calls finish before forcing the restart.</p>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="form-group">
+                        <label for="restart_timezone">Restart Timezone</label>
+                        <input type="text" class="form-control" id="restart_timezone" name="restart_timezone"
+                               value="<?php echo htmlspecialchars($restartTz); ?>"
+                               placeholder="America/Denver" list="restart_tz_list">
+                        <datalist id="restart_tz_list">
+                            <?php foreach (timezone_identifiers_list() as $tzName): ?>
+                            <option value="<?php echo htmlspecialchars($tzName); ?>">
+                            <?php endforeach; ?>
+                        </datalist>
+                        <p class="help-block">IANA timezone for the schedule. Blank = server local time.</p>
+                    </div>
+                </div>
+            </div>
+            <?php if ($nextRestart !== ''): ?>
+            <p class="help-block">
+                <i class="fa fa-clock-o"></i> Next scheduled restart:
+                <strong><?php echo htmlspecialchars($nextRestart); ?></strong>
+            </p>
+            <?php endif; ?>
+        </div>
+    </div>
+
     <!-- AMI Credentials -->
     <div class="panel panel-default">
         <div class="panel-heading">

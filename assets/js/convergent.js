@@ -827,7 +827,9 @@
                 url: 'ajax.php',
                 type: 'POST',
                 dataType: 'json',
-                timeout: 90000,
+                // ma install + version registration runs synchronously server-side;
+                // give it room beyond the default before the browser gives up.
+                timeout: 180000,
                 data: {
                     module:      'convergentdashboard',
                     command:     'install_module_update',
@@ -837,15 +839,22 @@
                 success: function(response) {
                     if (response.status) {
                         $status.html('<span class="text-success"><i class="fa fa-check-circle"></i> ' + self.escapeHtml(response.message) + '</span>');
-                        setTimeout(function() { location.reload(); }, 2000);
+                        // Give the background reload a moment before refreshing the page.
+                        setTimeout(function() { location.reload(); }, 4000);
                     } else {
-                        $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> ' + self.escapeHtml(response.message) + '</span>');
+                        var html = '<span class="text-danger"><i class="fa fa-times-circle"></i> ' + self.escapeHtml(response.message) + '</span>';
+                        if (response.output) {
+                            html += '<br><pre class="text-muted" style="max-height:160px;overflow:auto;white-space:pre-wrap;">'
+                                  + self.escapeHtml(response.output) + '</pre>';
+                        }
+                        $status.html(html);
                         $btn.prop('disabled', false).html('<i class="fa fa-download"></i> Retry');
                     }
                 },
                 error: function(xhr, status, error) {
-                    $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> Request failed: ' + error
-                        + '</span><br><small class="text-muted">Check /tmp/convergent-installmodule.log on the server.</small>');
+                    $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> Request failed: ' + self.escapeHtml(error)
+                        + '</span><br><small class="text-muted">If the new files landed, finish from a shell: '
+                        + 'fwconsole ma install convergentdashboard --force &amp;&amp; fwconsole reload</small>');
                     $btn.prop('disabled', false).html('<i class="fa fa-download"></i> Retry');
                 }
             });

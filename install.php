@@ -293,6 +293,13 @@ $defaults = [
     // SSL Paths (2 keys) - Auto-detected on install
     ['ssl_cert_path', $sslPaths['cert'], 'SSL certificate path'],
     ['ssl_key_path', $sslPaths['key'], 'SSL private key path'],
+
+    // Scheduled Restart (3 keys) - consumed by the Node service at startup.
+    // Defaults mirror the Node-side defaults; an empty restart_schedule disables
+    // the scheduled restart, an empty restart_timezone means host local time.
+    ['restart_schedule', '0 4 * * *', '5-field cron schedule for the service self-restart. Empty disables it.'],
+    ['restart_drain_timeout_seconds', '120', 'Seconds to let active calls finish before forcing a scheduled restart (10-600).'],
+    ['restart_timezone', '', 'IANA timezone the restart schedule is evaluated in. Blank = server local time.'],
 ];
 
 foreach ($defaults as $config) {

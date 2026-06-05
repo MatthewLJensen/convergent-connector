@@ -64,7 +64,7 @@ $statusLog = $convergent->getStatusLog(50);
 <div class="panel panel-default">
     <div class="panel-heading">
         <h3 class="panel-title">
-            <i class="fa fa-file-text-o"></i> Service Logs (journalctl)
+            <i class="fa fa-file-text-o"></i> Service Logs
             <button type="button" class="btn btn-xs btn-default pull-right" id="btn-refresh-journal">
                 <i class="fa fa-refresh"></i> Refresh
             </button>
