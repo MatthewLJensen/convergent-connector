@@ -38,6 +38,11 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
     /** Result marker written by hooks/updatecertificates */
     private const CERT_UPDATE_MARKER = '/tmp/convergent-cert-update.json';
 
+    /** Module self-update: rolling log + completion sentinel for the background
+     *  `fwconsole ma install` + reload job, polled by getModuleUpdateStatus(). */
+    private const MODULE_REGISTER_LOG  = '/tmp/convergent-modregister.log';
+    private const MODULE_REGISTER_DONE = '/tmp/convergent-modregister.done';
+
     public function install()
     {
         // install() runs as root via fwconsole
@@ -111,6 +116,7 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             'apply_update',
             'check_module_update',
             'install_module_update',
+            'module_update_status',
         ];
         return in_array($req, $allowed);
     }
@@ -191,6 +197,9 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
                 $tagName    = $_POST['tag_name']    ?? '';
                 $zipballUrl = $_POST['zipball_url']  ?? '';
                 return $this->downloadInstallModule($tagName, $zipballUrl);
+
+            case 'module_update_status':
+                return $this->getModuleUpdateStatus();
 
             default:
                 return ['status' => false, 'message' => 'Unknown command'];
@@ -1871,61 +1880,99 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
 
     /**
      * Register the on-disk module version with FreePBX so it isn't flagged
-     * "Pending Upgrade" (and disabled). Runs `fwconsole ma install` for this
-     * module synchronously so we can report exactly what happened — this doubles
-     * as the empirical test of whether fwconsole is runnable as the web user —
-     * then fires `fwconsole reload` in the background so we don't hold the HTTP
-     * request open for a full reload.
+     * "Pending Upgrade" (and disabled), then reload.
+     *
+     * `fwconsole ma install` can run longer than PHP's max_execution_time / the
+     * webserver read timeout, which would kill a synchronous request mid-install
+     * and surface a false error. So we launch it as a detached background job that
+     * writes a completion sentinel (MODULE_REGISTER_DONE, containing the install
+     * exit code) and a rolling log, and return immediately. The client polls
+     * getModuleUpdateStatus() to learn when it finished and whether it succeeded.
      */
     private function registerModuleUpgrade($tagName)
     {
         $whoami = posix_getpwuid(posix_getuid())['name'] ?? trim((string) @shell_exec('whoami'));
         $manual = 'fwconsole ma install convergentdashboard --force && fwconsole reload';
+        $safeTag = preg_replace('/[^a-zA-Z0-9._-]/', '', (string) $tagName);
 
         $fw = $this->findFwconsole();
         if (empty($fw)) {
             return [
-                'status'     => false,
-                'registered' => false,
-                'ran_as'     => $whoami,
-                'message'    => "Files for {$tagName} were copied into place, but fwconsole could not be found to "
+                'status'      => false,
+                'in_progress' => false,
+                'ran_as'      => $whoami,
+                'message'     => "Files for {$tagName} were copied into place, but fwconsole could not be found to "
                     . "register the new version, so the module will show as \"Pending Upgrade\" until you SSH in "
                     . "and run:  {$manual}",
             ];
         }
 
-        // `ma install <module>` runs install.php (idempotent here) for the
-        // already-on-disk files and sets the modules-table version = module.xml
-        // version (no repo download). --force smooths over dependency edge cases.
-        $install = $this->execCapture(escapeshellarg($fw) . ' ma install convergentdashboard --force', 150);
+        // Clear any prior run's markers so the poller only sees this run.
+        @unlink(self::MODULE_REGISTER_DONE);
+        @file_put_contents(self::MODULE_REGISTER_LOG, '');
 
-        if ($install['code'] !== 0) {
-            freepbx_log(FPBX_LOG_ERROR, "Convergent registerModuleUpgrade: ma install exit {$install['code']} (user={$whoami})");
+        $fwEsc   = escapeshellarg($fw);
+        $logEsc  = escapeshellarg(self::MODULE_REGISTER_LOG);
+        $doneEsc = escapeshellarg(self::MODULE_REGISTER_DONE);
+
+        // `ma install <module>` runs install.php (idempotent here) for the already-
+        // on-disk files and sets the modules-table version = module.xml version (no
+        // repo download). The sentinel is written right after install — before the
+        // slower reload — so the UI reports completion as soon as the version is
+        // registered; reload then applies config in the same detached job.
+        $job = "{ echo \"[start] \$(date) user=\$(whoami) tag={$safeTag}\"; "
+             . "{$fwEsc} ma install convergentdashboard --force; IRC=\$?; "
+             . "echo \"[ma install exit \$IRC]\"; "
+             . "echo \$IRC > {$doneEsc}; "
+             . "{$fwEsc} reload; echo \"[reload exit \$?]\"; "
+             . "echo '[done]'; } >> {$logEsc} 2>&1";
+        @exec('nohup bash -c ' . escapeshellarg($job) . ' > /dev/null 2>&1 &');
+
+        freepbx_log(FPBX_LOG_NOTICE, "Convergent registerModuleUpgrade: launched ma install for {$safeTag} (user={$whoami})");
+
+        return [
+            'status'      => true,
+            'in_progress' => true,
+            'ran_as'      => $whoami,
+            'message'     => "Files for {$tagName} are in place. Registering the new version…",
+        ];
+    }
+
+    /**
+     * Poll the background module-registration job started by registerModuleUpgrade().
+     * Reports whether it's still running, and once finished, success/failure (from
+     * the install exit code in the sentinel) plus a tail of the log.
+     */
+    public function getModuleUpdateStatus()
+    {
+        $log = file_exists(self::MODULE_REGISTER_LOG)
+            ? (string) @file_get_contents(self::MODULE_REGISTER_LOG)
+            : '';
+
+        if (!file_exists(self::MODULE_REGISTER_DONE)) {
             return [
-                'status'     => false,
-                'registered' => false,
-                'ran_as'     => $whoami,
-                'exit_code'  => $install['code'],
-                'output'     => $this->tailString($install['output'], 4000),
-                'message'    => "New files are in place, but registering the version failed "
-                    . "(fwconsole exited {$install['code']}, ran as '{$whoami}'). The module may show as "
-                    . "\"Pending Upgrade\" until resolved — try manually:  {$manual}",
+                'status'      => true,
+                'done'        => false,
+                'in_progress' => ($log !== ''),
+                'output'      => $this->tailString($log, 4000),
+                'message'     => ($log !== '') ? 'Registering the new version…' : 'No module update is running.',
             ];
         }
 
-        // Apply config in the background; a full reload is too slow to hold the
-        // request open, and the GUI already runs the new version after the install.
-        $reloadLog = '/tmp/convergent-modulereload.log';
-        @exec('nohup ' . escapeshellarg($fw) . ' reload >> ' . escapeshellarg($reloadLog) . ' 2>&1 &');
-
-        freepbx_log(FPBX_LOG_NOTICE, "Convergent registerModuleUpgrade: registered {$tagName} via ma install (user={$whoami})");
+        $exit    = (int) trim((string) @file_get_contents(self::MODULE_REGISTER_DONE));
+        $success = ($exit === 0);
 
         return [
-            'status'     => true,
-            'registered' => true,
-            'ran_as'     => $whoami,
-            'output'     => $this->tailString($install['output'], 4000),
-            'message'    => "Module updated to {$tagName} and registered. Applying configuration in the background…",
+            'status'      => $success,
+            'done'        => true,
+            'in_progress' => false,
+            'exit_code'   => $exit,
+            'output'      => $this->tailString($log, 4000),
+            'message'     => $success
+                ? 'Module update complete and registered.'
+                : "Registering the new version failed (fwconsole exited {$exit}). The module may show as "
+                  . "\"Pending Upgrade\" — see the output below, or run "
+                  . "'fwconsole ma install convergentdashboard --force' from a shell.",
         ];
     }
 

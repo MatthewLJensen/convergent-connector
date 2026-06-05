@@ -581,6 +581,10 @@ if ($certStatus) {
             <button type="button" class="btn btn-default" id="btn-check-module-update">
                 <i class="fa fa-refresh"></i> Check for Module Update
             </button>
+            <button type="button" class="btn btn-warning" id="btn-force-reinstall-module"
+                    title="Re-download and reinstall the latest release even if you're already on it (for testing the update flow)">
+                <i class="fa fa-recycle"></i> Force Reinstall
+            </button>
             <span id="module-update-status" class="text-muted" style="margin-left: 10px;"></span>
         </div>
     </div>

@@ -112,6 +112,9 @@
             $('#btn-check-module-update').off('click.cvg').on('click.cvg', function() {
                 self.checkModuleUpdate();
             });
+            $('#btn-force-reinstall-module').off('click.cvg').on('click.cvg', function() {
+                self.forceReinstallModule();
+            });
             $('#btn-update-certificates').off('click.cvg').on('click.cvg', function() {
                 self.updateCertificates();
             });
@@ -814,22 +817,74 @@
             });
         },
 
-        // Download and install a module update from GitHub
+        // Re-download and reinstall the latest release regardless of version.
+        // Useful for testing the update flow when already on the newest version.
+        forceReinstallModule: function() {
+            var self = this;
+            var $btn    = $('#btn-force-reinstall-module');
+            var $status = $('#module-update-status');
+            var originalHtml = $btn.html();
+
+            if (!window.confirm('Re-download and reinstall the latest release now? '
+                    + 'This runs the full update flow even if you are already up to date.')) {
+                return;
+            }
+
+            $btn.prop('disabled', true).html('<span class="loading-spinner"></span> Fetching latest…');
+            $status.html('<span class="text-info"><i class="fa fa-spinner fa-spin"></i> Looking up the latest release…</span>');
+
+            // Reuse the update check purely to resolve the latest tag + zipball URL,
+            // then install unconditionally (the backend ma install --force re-runs
+            // even on the same version).
+            $.ajax({
+                url: 'ajax.php',
+                type: 'POST',
+                dataType: 'json',
+                data: {
+                    module:  'convergentdashboard',
+                    command: 'check_module_update'
+                },
+                success: function(response) {
+                    if (response.status && response.tag_name && response.zipball_url) {
+                        // Keep this button disabled through the install (installModuleUpdate
+                        // drives #btn-install-module-update, which doesn't exist in this flow).
+                        // installModuleUpdate restores it on failure; success reloads the page.
+                        $btn.html('<span class="loading-spinner"></span> Reinstalling…');
+                        self.installModuleUpdate(response.tag_name, response.zipball_url);
+                    } else {
+                        $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> '
+                            + 'Could not resolve a release to reinstall: '
+                            + self.escapeHtml(response.message || 'no release data') + '</span>');
+                        $btn.prop('disabled', false).html(originalHtml);
+                    }
+                },
+                error: function(xhr, status, error) {
+                    $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> Request failed: '
+                        + self.escapeHtml(error) + '</span>');
+                    $btn.prop('disabled', false).html(originalHtml);
+                }
+            });
+        },
+
+        // Download and install a module update from GitHub. The server copies the
+        // files synchronously, then registers the new version (fwconsole ma install
+        // + reload) in a detached background job; we poll for its completion rather
+        // than holding one long request open (which the server can time out and kill).
         installModuleUpdate: function(tagName, zipballUrl) {
             var self = this;
             var $btn    = $('#btn-install-module-update');
             var $status = $('#module-update-status');
 
             $btn.prop('disabled', true).html('<span class="loading-spinner"></span> Installing...');
-            $status.find('span:first').html('<span class="text-info"><i class="fa fa-spinner fa-spin"></i> Downloading and installing — this may take a moment...</span>');
+            $status.html('<span class="text-info"><i class="fa fa-spinner fa-spin"></i> Downloading and copying files…</span>');
 
             $.ajax({
                 url: 'ajax.php',
                 type: 'POST',
                 dataType: 'json',
-                // ma install + version registration runs synchronously server-side;
-                // give it room beyond the default before the browser gives up.
-                timeout: 180000,
+                // Covers only the download + extract + copy; the slow fwconsole work
+                // is backgrounded and tracked via polling below.
+                timeout: 120000,
                 data: {
                     module:      'convergentdashboard',
                     command:     'install_module_update',
@@ -837,27 +892,96 @@
                     zipball_url: zipballUrl
                 },
                 success: function(response) {
-                    if (response.status) {
+                    if (response.status && response.in_progress) {
+                        // Files copied; registration job launched — poll for completion.
+                        self.pollModuleUpdateStatus(0);
+                    } else if (response.status) {
+                        // No background job (shouldn't normally happen) — treat as done.
                         $status.html('<span class="text-success"><i class="fa fa-check-circle"></i> ' + self.escapeHtml(response.message) + '</span>');
-                        // Give the background reload a moment before refreshing the page.
-                        setTimeout(function() { location.reload(); }, 4000);
+                        setTimeout(function() { location.reload(); }, 3000);
                     } else {
+                        // Download / extract / copy / no-fwconsole failure (synchronous).
                         var html = '<span class="text-danger"><i class="fa fa-times-circle"></i> ' + self.escapeHtml(response.message) + '</span>';
                         if (response.output) {
                             html += '<br><pre class="text-muted" style="max-height:160px;overflow:auto;white-space:pre-wrap;">'
                                   + self.escapeHtml(response.output) + '</pre>';
                         }
                         $status.html(html);
-                        $btn.prop('disabled', false).html('<i class="fa fa-download"></i> Retry');
+                        self.restoreModuleButtons();
                     }
                 },
                 error: function(xhr, status, error) {
                     $status.html('<span class="text-danger"><i class="fa fa-times-circle"></i> Request failed: ' + self.escapeHtml(error)
                         + '</span><br><small class="text-muted">If the new files landed, finish from a shell: '
                         + 'fwconsole ma install convergentdashboard --force &amp;&amp; fwconsole reload</small>');
-                    $btn.prop('disabled', false).html('<i class="fa fa-download"></i> Retry');
+                    self.restoreModuleButtons();
                 }
             });
+        },
+
+        // Poll the background registration job until it reports done (or we give up).
+        pollModuleUpdateStatus: function(attempt) {
+            var self = this;
+            var $status = $('#module-update-status');
+            var INTERVAL_MS  = 3000;
+            var MAX_ATTEMPTS = 80; // ~4 min ceiling at 3s
+
+            $.ajax({
+                url: 'ajax.php',
+                type: 'POST',
+                dataType: 'json',
+                data: {
+                    module:  'convergentdashboard',
+                    command: 'module_update_status'
+                },
+                success: function(resp) {
+                    if (resp.done) {
+                        if (resp.status) {
+                            $status.html('<span class="text-success"><i class="fa fa-check-circle"></i> ' + self.escapeHtml(resp.message) + '</span>');
+                            // Version is registered; refresh to show it (reload finishes in the background).
+                            setTimeout(function() { location.reload(); }, 1500);
+                        } else {
+                            var html = '<span class="text-danger"><i class="fa fa-times-circle"></i> ' + self.escapeHtml(resp.message) + '</span>';
+                            if (resp.output) {
+                                html += '<br><pre class="text-muted" style="max-height:160px;overflow:auto;white-space:pre-wrap;">'
+                                      + self.escapeHtml(resp.output) + '</pre>';
+                            }
+                            $status.html(html);
+                            self.restoreModuleButtons();
+                        }
+                        return; // stop polling
+                    }
+
+                    if (attempt >= MAX_ATTEMPTS) {
+                        $status.html('<span class="text-warning"><i class="fa fa-clock-o"></i> Still registering after '
+                            + Math.round((MAX_ATTEMPTS * INTERVAL_MS) / 1000) + 's. It may still finish — check '
+                            + 'the Module Version above after a moment, or '
+                            + '/tmp/convergent-modregister.log on the server.</span>');
+                        self.restoreModuleButtons();
+                        return;
+                    }
+
+                    $status.html('<span class="text-info"><i class="fa fa-spinner fa-spin"></i> Registering the new version… ('
+                        + ((attempt + 1) * (INTERVAL_MS / 1000)) + 's)</span>');
+                    setTimeout(function() { self.pollModuleUpdateStatus(attempt + 1); }, INTERVAL_MS);
+                },
+                error: function() {
+                    // A reload can briefly disrupt the web tier; keep polling unless we've hit the ceiling.
+                    if (attempt >= MAX_ATTEMPTS) {
+                        $status.html('<span class="text-warning"><i class="fa fa-clock-o"></i> Lost contact while polling. '
+                            + 'Refresh the page to check the installed version.</span>');
+                        self.restoreModuleButtons();
+                        return;
+                    }
+                    setTimeout(function() { self.pollModuleUpdateStatus(attempt + 1); }, INTERVAL_MS);
+                }
+            });
+        },
+
+        // Reset both module-update trigger buttons to their idle state.
+        restoreModuleButtons: function() {
+            $('#btn-install-module-update').prop('disabled', false).html('<i class="fa fa-download"></i> Retry');
+            $('#btn-force-reinstall-module').prop('disabled', false).html('<i class="fa fa-recycle"></i> Force Reinstall');
         },
 
         // HTML escape helper
