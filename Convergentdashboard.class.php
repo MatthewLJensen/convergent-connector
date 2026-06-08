@@ -401,9 +401,20 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
         $tz = trim((string)($this->getConfigValue('restart_timezone') ?? ''));
         try {
             $tzObj = new \DateTimeZone($tz !== '' ? $tz : date_default_timezone_get());
-            $cron  = new \Cron\CronExpression($schedule);
+            // Bundled cron-expression versions differ: mtdowling 1.x/2.x require a
+            // FieldFactory as the 2nd constructor arg and expose ::factory(), while
+            // dragonmantank 3.x dropped factory() and the constructor takes one arg.
+            if (method_exists('\Cron\CronExpression', 'factory')) {
+                $cron = \Cron\CronExpression::factory($schedule);
+            } else {
+                $cron = new \Cron\CronExpression($schedule);
+            }
             return $cron->getNextRunDate(new \DateTime('now', $tzObj))->format('Y-m-d H:i:s T');
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            // Best-effort preview only: a bad schedule, missing tz, or a cron-library
+            // API mismatch (ArgumentCountError is an Error, not an Exception) must not
+            // fatal the page — just show no preview.
+            freepbx_log(FPBX_LOG_NOTICE, "Convergent getNextRestartPreview: " . $e->getMessage());
             return '';
         }
     }
