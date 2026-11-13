@@ -20,8 +20,18 @@ git clone https://github.com/MatthewLJensen/convergent-connector \
     /var/www/html/admin/modules/convergentdashboard
 chown -R asterisk:asterisk /var/www/html/admin/modules/convergentdashboard
 fwconsole ma install convergentdashboard
+fwconsole convergent trust-key   # once per system: no "unsigned module" warning
 fwconsole reload
 ```
+
+### Signed releases
+
+`main` and every release tag are signed with the Convergent release key, fingerprint
+`E40F A5E8 A108 D1B8 2640 8E0D B63E 9EEE E8CD A76F`. OpenProv uses the same key.
+FreePBX warns about modules that aren't signed by Sangoma. `fwconsole convergent trust-key`,
+run as root, tells it to trust this key instead (`--status` to check, `--remove` to undo).
+Skip it and the module still works, with the warning. [SIGNING.md](SIGNING.md) covers
+what it changes and how releases are signed.
 
 ## Upgrading
 
@@ -44,7 +54,7 @@ fwconsole reload
 > "Pending Upgrade" and disabled until `install` (or a Module Admin upgrade)
 > registers the new version. A bare `git pull` + `fwconsole reload` is not enough.
 > (`ma install <module>` runs the local files already on disk — it does not
-> download from a repo, so it works for this unsigned module.)
+> download from a repo.)
 
 ## Configuration
 

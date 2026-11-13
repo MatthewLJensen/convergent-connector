@@ -28,4 +28,9 @@
             <method namespace="FreePBX\modules" class="Convergentdashboard" callingMethod="fwcChownFiles">chownFreepbx</method>
         </framework>
     </hooks>
+    <console>
+        <command>
+            <name>convergent</name>
+        </command>
+    </console>
 </module>
