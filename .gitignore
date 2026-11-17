@@ -1,2 +1,3 @@
-.claude/dist/
+.claude/
+dist/
 __pycache__/
