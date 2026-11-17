@@ -90,6 +90,14 @@ if (isset($_SESSION['convergent_message'])) {
     </div>
 </div>
 
+<?php
+// Version the asset URLs by file mtime so a browser never runs a cached copy
+// from an older release. This tag runs before FreePBX's own include of
+// assets/js, and convergent.js keeps whichever copy runs first.
+$assetVer = function ($rel) {
+    return 'modules/convergentdashboard/' . $rel . '?v=' . (int) @filemtime(__DIR__ . '/' . $rel);
+};
+?>
 <!-- Include module CSS and JS -->
-<link rel="stylesheet" href="modules/convergentdashboard/assets/css/convergent.css">
-<script src="modules/convergentdashboard/assets/js/convergent.js"></script>
+<link rel="stylesheet" href="<?php echo htmlspecialchars($assetVer('assets/css/convergent.css')); ?>">
+<script src="<?php echo htmlspecialchars($assetVer('assets/js/convergent.js')); ?>"></script>

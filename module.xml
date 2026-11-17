@@ -3,7 +3,7 @@
     <rawname>convergentdashboard</rawname>
     <repo>unsupported</repo>
     <name>Convergent Dashboard</name>
-    <version>1.0.7</version>
+    <version>1.0.8</version>
     <publisher>Convergent Communications</publisher>
     <license>GPLv3+</license>
     <licenselink>https://www.gnu.org/licenses/gpl-3.0.txt</licenselink>
@@ -14,6 +14,11 @@
         View service status, configure credentials,
         and manage server updates.
     </description>
+    <updateurl>https://github.com/MatthewLJensen/convergent-connector/releases/latest/download/update.json</updateurl>
+    <changelog>
+        *1.0.8* Updates: module.xml has an updateurl, so fwconsole ma upgrade convergentdashboard (and FreePBX's module updates) fetch the latest GitHub release. The module's CSS and JS URLs are versioned, so browsers no longer run a cached copy from an older release (which left the Status panels stuck on "Checking...").
+        *1.0.7* Status tab loads immediately; the prerequisites, service and certificate panels load in parallel and appear as their checks finish. Faster Node.js detection. Signed with the Convergent release key.
+    </changelog>
     <supported>
         <version>17.0</version>
     </supported>
