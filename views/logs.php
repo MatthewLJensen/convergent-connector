@@ -153,8 +153,13 @@ function loadJournalLogs() {
     });
 }
 
-// Initial load
-loadJournalLogs();
+// Initial load: only once the Logs tab is visible, so other tabs don't pay
+// for it (it can fall back to querying PM2, which is slow).
+if ($('#logs').hasClass('active')) {
+    loadJournalLogs();
+} else {
+    $('a[href="#logs"]').one('shown.bs.tab', loadJournalLogs);
+}
 
 // Refresh button
 document.getElementById('btn-refresh-journal').addEventListener('click', loadJournalLogs);

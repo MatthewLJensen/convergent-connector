@@ -38,6 +38,7 @@
 
             this.bindEvents();
             this.initPasswordToggles();
+            this.initStatusSections();
         },
 
         // Track the current tab (updated on tab switch)
@@ -84,10 +85,30 @@
                 self.copyToSettings(type);
             });
 
-            // Direct element handlers — .off().on() also deduplicates these
-            $('#btn-refresh-status').off('click.cvg').on('click.cvg', function() {
+            // Buttons inside the Status tab's lazily-loaded panels: those panels
+            // are replaced over AJAX after this runs, so delegate from document.
+            $(document).off('click.cvg-refresh-status', '#btn-refresh-status')
+                       .on('click.cvg-refresh-status', '#btn-refresh-status', function() {
                 self.refreshStatus();
             });
+            $(document).off('click.cvg-setup', '#btn-setup-service')
+                       .on('click.cvg-setup', '#btn-setup-service', function() {
+                self.setupService();
+            });
+            $(document).off('click.cvg-update-certs', '#btn-update-certificates')
+                       .on('click.cvg-update-certs', '#btn-update-certificates', function() {
+                self.updateCertificates();
+            });
+            $(document).off('click.cvg-refresh-cert', '#btn-refresh-cert-info')
+                       .on('click.cvg-refresh-cert', '#btn-refresh-cert-info', function() {
+                self.loadStatusSection('cert');
+            });
+            $(document).off('click.cvg-retry', '.btn-cvg-section-retry')
+                       .on('click.cvg-retry', '.btn-cvg-section-retry', function() {
+                self.loadStatusSection($(this).data('section'), true);
+            });
+
+            // Direct element handlers — .off().on() also deduplicates these
             $('#btn-check-update').off('click.cvg').on('click.cvg', function() {
                 self.checkForUpdates();
             });
@@ -106,21 +127,115 @@
             $('#btn-copy-all-to-settings').off('click.cvg').on('click.cvg', function() {
                 self.copyAllToSettings();
             });
-            $('#btn-setup-service').off('click.cvg').on('click.cvg', function() {
-                self.setupService();
-            });
             $('#btn-check-module-update').off('click.cvg').on('click.cvg', function() {
                 self.checkModuleUpdate();
             });
             $('#btn-force-reinstall-module').off('click.cvg').on('click.cvg', function() {
                 self.forceReinstallModule();
             });
-            $('#btn-update-certificates').off('click.cvg').on('click.cvg', function() {
-                self.updateCertificates();
+        },
+
+        // In-flight status_section requests, by section name
+        _sectionRequests: {},
+
+        // Load the Status tab's slow panels the first time that tab is shown
+        // (straight away if the page opened on it). Loading them only when
+        // needed keeps other tabs from paying for PM2/Node checks.
+        initStatusSections: function() {
+            var self = this;
+            if (!$('.cvg-status-section').length) {
+                return;
+            }
+            if ($('#status').hasClass('active')) {
+                this.loadStatusSections(false);
+                return;
+            }
+            $('a[href="#status"]').one('shown.bs.tab', function() {
+                self.loadStatusSections(false);
             });
-            $('#btn-refresh-cert-info').off('click.cvg').on('click.cvg', function() {
-                self.reloadPage();
+        },
+
+        // Request every Status-tab panel in parallel; each one renders as soon
+        // as its own response arrives.
+        loadStatusSections: function(fresh) {
+            var self = this;
+            $('.cvg-status-section').each(function() {
+                self.loadStatusSection($(this).data('section'), fresh);
             });
+        },
+
+        // Fetch one server-rendered Status-tab panel and swap it in.
+        // fresh: bypass the server's short-lived Node.js detection cache.
+        loadStatusSection: function(section, fresh) {
+            var self = this;
+            var $container = $('.cvg-status-section[data-section="' + section + '"]');
+            if (!$container.length) {
+                return;
+            }
+
+            // A newer request for the same section supersedes an older one
+            if (this._sectionRequests[section]) {
+                this._sectionRequests[section].abort();
+            }
+            $container.addClass('cvg-section-refreshing');
+
+            var xhr = $.ajax({
+                url: 'ajax.php',
+                type: 'POST',
+                dataType: 'json',
+                timeout: 60000,
+                data: {
+                    module: 'convergentdashboard',
+                    command: 'status_section',
+                    section: section,
+                    fresh: fresh ? 1 : 0
+                },
+                success: function(response) {
+                    if (response && response.status && typeof response.html === 'string') {
+                        $container.html(response.html);
+                        self.afterStatusSectionLoaded(section, $container);
+                    } else {
+                        self.showSectionError($container, section,
+                            (response && response.message) || 'Unexpected response from server');
+                    }
+                },
+                error: function(jqXHR, status, error) {
+                    if (status === 'abort') {
+                        return;
+                    }
+                    self.showSectionError($container, section,
+                        status === 'timeout' ? 'Timed out' : (error || status || 'Request failed'));
+                },
+                complete: function(jqXHR) {
+                    if (self._sectionRequests[section] === jqXHR) {
+                        delete self._sectionRequests[section];
+                        $container.removeClass('cvg-section-refreshing');
+                    }
+                }
+            });
+            this._sectionRequests[section] = xhr;
+        },
+
+        // Wire up anything outside a panel that depends on what it reported
+        afterStatusSectionLoaded: function(section, $container) {
+            if (section === 'service') {
+                // The Quick Actions test is only meaningful once the service is set up
+                var ready = String($container.find('#cvg-service-panel').data('all-ready')) === '1';
+                $('#btn-test-connection').prop('disabled', !ready);
+            }
+        },
+
+        showSectionError: function($container, section, message) {
+            var title = $container.find('.panel-title').first().html() || this.escapeHtml(section);
+            $container.html(
+                '<div class="panel panel-danger">'
+                + '<div class="panel-heading"><h3 class="panel-title">' + title + '</h3></div>'
+                + '<div class="panel-body">'
+                + '<i class="fa fa-times-circle"></i> Could not load this section: ' + this.escapeHtml(message)
+                + ' <button type="button" class="btn btn-default btn-sm btn-cvg-section-retry" data-section="'
+                + this.escapeHtml(section) + '" style="margin-left: 10px;"><i class="fa fa-refresh"></i> Retry</button>'
+                + '</div></div>'
+            );
         },
 
         // Initialize password toggle buttons
@@ -184,17 +299,14 @@
             });
         },
 
-        // Refresh service status
+        // Refresh the prerequisites and service panels in place (no page
+        // reload, so nothing can replay a previous POST). Prerequisites are
+        // re-detected rather than taken from the server's short-lived cache.
         refreshStatus: function() {
-            var $btn = $('#btn-refresh-status');
-            $btn.prop('disabled', true).html('<span class="loading-spinner"></span> Refreshing...');
-
-            // Use reloadPage() (window.location.href) instead of location.reload() so the
-            // browser issues a GET rather than replaying FreePBX's previous POST navigation,
-            // which was causing the service action to fire twice.
-            setTimeout(function() {
-                Convergent.reloadPage();
-            }, 500);
+            $('#btn-refresh-status').prop('disabled', true)
+                .html('<span class="loading-spinner"></span> Refreshing...');
+            this.loadStatusSection('prereqs', true);
+            this.loadStatusSection('service', false);
         },
 
         // Check for updates

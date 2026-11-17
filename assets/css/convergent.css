@@ -177,3 +177,13 @@ pre {
     margin: 0;
     max-height: none;
 }
+
+/* Status tab panels loaded over AJAX (views/status.php) */
+.cvg-status-section .cvg-section-loading .panel-body {
+    padding: 20px 15px;
+}
+
+.cvg-status-section.cvg-section-refreshing > .panel {
+    opacity: 0.6;
+    transition: opacity 0.15s ease-in-out;
+}

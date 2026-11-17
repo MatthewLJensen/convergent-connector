@@ -12,21 +12,12 @@ $convergent = FreePBX::Convergentdashboard();
 // Handle tab selection
 $activeTab = isset($_GET['tab']) ? $_GET['tab'] : 'status';
 
-// Get current data
+// Get current data. Only cheap reads here: the slow Status-tab checks (PM2,
+// Node.js detection, certificate) load over AJAX once the page is up; see
+// views/status.php and Convergentdashboard::renderStatusSection().
 $config        = $convergent->getAllConfig();
 $version       = $convergent->getInstalledVersion();
 $moduleVersion = $convergent->getModuleVersion();
-
-// Only run expensive checks on the status tab
-if ($activeTab === 'status') {
-    $serviceStatus   = $convergent->getServiceStatus();
-    $prerequisites   = $convergent->checkPrerequisites();
-    $certificateInfo = $convergent->getCertificateInfo();
-} else {
-    $serviceStatus   = ['service' => []];
-    $prerequisites   = ['prerequisites' => [], 'all_ready' => false, 'can_setup' => false];
-    $certificateInfo = ['status' => false, 'code' => 'not_configured', 'cert' => ['path' => '']];
-}
 
 // Get success/error messages from form submissions
 $message = '';

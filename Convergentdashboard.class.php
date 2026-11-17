@@ -117,6 +117,7 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             'check_module_update',
             'install_module_update',
             'module_update_status',
+            'status_section',
         ];
         return in_array($req, $allowed);
     }
@@ -200,6 +201,19 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
 
             case 'module_update_status':
                 return $this->getModuleUpdateStatus();
+
+            case 'status_section':
+                // The Status tab requests its sections in parallel. PHP holds the
+                // session file lock for the whole request, which would make those
+                // requests queue behind each other; nothing here writes to the
+                // session, so release it now.
+                if (session_status() === PHP_SESSION_ACTIVE) {
+                    session_write_close();
+                }
+                return $this->renderStatusSection(
+                    $_REQUEST['section'] ?? '',
+                    !empty($_REQUEST['fresh'])
+                );
 
             default:
                 return ['status' => false, 'message' => 'Unknown command'];
@@ -955,9 +969,10 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
         $uptime = $status['pm2_env']['created_at_human_diff'] ?? '';
         $memory = $status['monit']['human_memory'] ?? '';
 
-        // Check WebSocket port
+        // Check WebSocket port. No -p: it makes ss walk every process's fds in
+        // /proc, which is slow, and the owning process isn't used here.
         $portOutput = [];
-        exec("ss -tlnp | grep :" . escapeshellarg($wssPort) . " 2>&1", $portOutput);
+        exec('ss -tln 2>/dev/null | grep -E ' . escapeshellarg(':' . (int) $wssPort . '\b'), $portOutput);
         $portListening = !empty($portOutput);
 
         return [
@@ -2289,12 +2304,14 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             return $result;
         }
 
-        // Try to get node path from nvm by sourcing nvm.sh
-        // Since PHP/httpd runs as asterisk, we can do this directly
-        $script = "source {$homeDir}/.nvm/nvm.sh 2>/dev/null && which node 2>/dev/null";
+        // Get node's path and version from nvm by sourcing nvm.sh. Since
+        // PHP/httpd runs as asterisk, we can do this directly. Sourcing nvm.sh
+        // is slow, so source it once and print both lines.
+        $nvmSh = escapeshellarg("{$homeDir}/.nvm/nvm.sh");
+        $script = "source {$nvmSh} 2>/dev/null && command -v node && node --version";
         $output = [];
         $returnCode = 0;
-        exec("bash -c " . escapeshellarg($script) . " 2>&1", $output, $returnCode);
+        exec("bash -c " . escapeshellarg($script) . " 2>/dev/null", $output, $returnCode);
 
         if ($returnCode !== 0 || empty($output[0])) {
             // nvm not available
@@ -2306,15 +2323,7 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             return $result;
         }
 
-        // Get node version
-        $versionOutput = [];
-        exec("bash -c " . escapeshellarg("source {$homeDir}/.nvm/nvm.sh 2>/dev/null && node --version 2>/dev/null") . " 2>&1", $versionOutput, $versionCode);
-
-        $nodeVersion = '';
-        if ($versionCode === 0 && !empty($versionOutput[0])) {
-            $nodeVersion = trim($versionOutput[0]);
-            $nodeVersion = ltrim($nodeVersion, 'v');
-        }
+        $nodeVersion = ltrim(trim($output[1] ?? ''), 'v');
 
         if (empty($nodeVersion)) {
             return $result;
@@ -2359,10 +2368,19 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
         }
     }
 
+    /** How long the Status tab may reuse a Node.js detection result (seconds). */
+    private const NODE_DETECT_TTL = 600;
+
     /**
-     * Check prerequisites for the service
+     * Check prerequisites for the service.
+     *
+     * Node.js detection is the slow part (it shells out to bash and sources
+     * nvm.sh). With $useCache, a detection result up to NODE_DETECT_TTL old is
+     * reused; only the Status tab display passes it. setupService(), updates
+     * and the Status tab's Refresh button always detect afresh, and every
+     * fresh detection refreshes the cache.
      */
-    public function checkPrerequisites()
+    public function checkPrerequisites($useCache = false)
     {
         $installPath = self::INSTALL_PATH;
 
@@ -2409,6 +2427,64 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             ]
         ];
 
+        $cached = $useCache ? $this->getCachedNodePrerequisite() : null;
+        if ($cached !== null) {
+            $prerequisites['node'] = $cached;
+        } else {
+            $prerequisites['node'] = $this->detectNodePrerequisite($prerequisites['node']);
+            $this->setCachedNodePrerequisite($prerequisites['node']);
+        }
+
+        // Set messages for other prerequisites
+        if (!$prerequisites['server_code']['installed']) {
+            $prerequisites['server_code']['message'] = "Server code not found at {$installPath}";
+        }
+        if (!$prerequisites['compiled_js']['installed']) {
+            $prerequisites['compiled_js']['message'] = "Compiled JavaScript not found. Run: cd {$installPath} && npm run build";
+        }
+        if (!$prerequisites['node_modules']['installed']) {
+            $prerequisites['node_modules']['message'] = "Dependencies not installed. Run: cd {$installPath} && npm install";
+        }
+        if (!$prerequisites['pm2']['installed']) {
+            $prerequisites['pm2']['message'] = 'FreePBX PM2 module not found. Install it via Module Admin.';
+        }
+        if (!$prerequisites['start_script']['installed']) {
+            $prerequisites['start_script']['message'] = 'Click "Setup Service" to create the start script.';
+        }
+
+        // Calculate overall readiness
+        $allReady = $prerequisites['server_code']['installed'] &&
+                    $prerequisites['compiled_js']['installed'] &&
+                    $prerequisites['node_modules']['installed'] &&
+                    $prerequisites['node']['installed'] &&
+                    $prerequisites['node']['version_ok'] &&
+                    $prerequisites['pm2']['installed'] &&
+                    $prerequisites['start_script']['installed'];
+
+        $canSetup = $prerequisites['server_code']['installed'] &&
+                    $prerequisites['compiled_js']['installed'] &&
+                    $prerequisites['node_modules']['installed'] &&
+                    $prerequisites['node']['installed'] &&
+                    $prerequisites['node']['version_ok'] &&
+                    $prerequisites['pm2']['installed'];
+
+        return [
+            'status' => true,
+            'prerequisites' => $prerequisites,
+            'all_ready' => $allReady,
+            'can_setup' => $canSetup,
+            'install_path' => $installPath
+        ];
+    }
+
+    /**
+     * Fill in the Node.js prerequisite entry ($node holds its defaults).
+     * Prefers an nvm-managed Node, then falls back to the system one.
+     */
+    private function detectNodePrerequisite(array $node)
+    {
+        $prerequisites = ['node' => $node];
+
         // Check nvm first (preferred - avoids PATH issues with global packages)
         $nvmInfo = $this->findNvmNode();
         $prerequisites['node']['nvm_info'] = $nvmInfo;
@@ -2453,46 +2529,100 @@ class Convergentdashboard extends \FreePBX_Helpers implements \BMO
             }
         }
 
-        // Set messages for other prerequisites
-        if (!$prerequisites['server_code']['installed']) {
-            $prerequisites['server_code']['message'] = "Server code not found at {$installPath}";
-        }
-        if (!$prerequisites['compiled_js']['installed']) {
-            $prerequisites['compiled_js']['message'] = "Compiled JavaScript not found. Run: cd {$installPath} && npm run build";
-        }
-        if (!$prerequisites['node_modules']['installed']) {
-            $prerequisites['node_modules']['message'] = "Dependencies not installed. Run: cd {$installPath} && npm install";
-        }
-        if (!$prerequisites['pm2']['installed']) {
-            $prerequisites['pm2']['message'] = 'FreePBX PM2 module not found. Install it via Module Admin.';
-        }
-        if (!$prerequisites['start_script']['installed']) {
-            $prerequisites['start_script']['message'] = 'Click "Setup Service" to create the start script.';
-        }
+        return $prerequisites['node'];
+    }
 
-        // Calculate overall readiness
-        $allReady = $prerequisites['server_code']['installed'] &&
-                    $prerequisites['compiled_js']['installed'] &&
-                    $prerequisites['node_modules']['installed'] &&
-                    $prerequisites['node']['installed'] &&
-                    $prerequisites['node']['version_ok'] &&
-                    $prerequisites['pm2']['installed'] &&
-                    $prerequisites['start_script']['installed'];
+    /** kvstore key for the cached Node.js detection result. */
+    private function nodeCacheKey()
+    {
+        // Detection depends on the user PHP runs as (nvm lives in its $HOME).
+        return 'node_detect_cache_' . (function_exists('posix_getuid') ? posix_getuid() : 'x');
+    }
 
-        $canSetup = $prerequisites['server_code']['installed'] &&
-                    $prerequisites['compiled_js']['installed'] &&
-                    $prerequisites['node_modules']['installed'] &&
-                    $prerequisites['node']['installed'] &&
-                    $prerequisites['node']['version_ok'] &&
-                    $prerequisites['pm2']['installed'];
+    /** A cached Node.js prerequisite entry younger than NODE_DETECT_TTL, or null. */
+    private function getCachedNodePrerequisite()
+    {
+        try {
+            $entry = $this->getConfig($this->nodeCacheKey());
+        } catch (\Throwable $e) {
+            return null;
+        }
+        if (!is_array($entry) || !isset($entry['at'], $entry['node']) || !is_array($entry['node'])) {
+            return null;
+        }
+        $age = time() - (int) $entry['at'];
+        if ($age < 0 || $age > self::NODE_DETECT_TTL) {
+            return null;
+        }
+        return $entry['node'];
+    }
 
-        return [
-            'status' => true,
-            'prerequisites' => $prerequisites,
-            'all_ready' => $allReady,
-            'can_setup' => $canSetup,
-            'install_path' => $installPath
+    private function setCachedNodePrerequisite(array $node)
+    {
+        try {
+            $this->setConfig($this->nodeCacheKey(), ['at' => time(), 'node' => $node]);
+        } catch (\Throwable $e) {
+            // The cache is only an optimisation; detection still worked.
+        }
+    }
+
+    /**
+     * Render one lazily-loaded panel of the Status tab (views/status_*.php).
+     *
+     * The Status tab ships as a shell with placeholders, and the browser
+     * requests each section in parallel, so each panel appears as soon as
+     * its own (possibly slow) checks finish, instead of the whole page
+     * waiting on all of them in sequence.
+     *
+     * @param string $section prereqs | service | cert
+     * @param bool   $fresh   skip the Node.js detection cache (Refresh button)
+     */
+    public function renderStatusSection($section, $fresh = false)
+    {
+        $views = [
+            'prereqs' => 'status_prereqs.php',
+            'service' => 'status_service.php',
+            'cert'    => 'status_cert.php',
         ];
+        if (!isset($views[$section])) {
+            return ['status' => false, 'message' => 'Unknown status section'];
+        }
+
+        // Lets the partials' direct-access guard pass whether or not the ajax
+        // bootstrap defines FREEPBX_IS_AUTH.
+        if (!defined('CONVERGENT_STATUS_SECTION')) {
+            define('CONVERGENT_STATUS_SECTION', true);
+        }
+
+        try {
+            $vars = [];
+            if ($section === 'prereqs' || $section === 'service') {
+                // The service panel needs all_ready too (it gates the controls).
+                $vars['prerequisites'] = $this->checkPrerequisites(!$fresh);
+            }
+            if ($section === 'service') {
+                $vars['serviceStatus'] = $this->getServiceStatus();
+            }
+            if ($section === 'cert') {
+                $vars['certificateInfo'] = $this->getCertificateInfo();
+            }
+
+            $html = (function ($__view, $__vars) {
+                extract($__vars);
+                ob_start();
+                try {
+                    include $__view;
+                } finally {
+                    $out = ob_get_clean();
+                }
+                return $out;
+            })(__DIR__ . '/views/' . $views[$section], $vars);
+        } catch (\Throwable $e) {
+            freepbx_log(FPBX_LOG_ERROR, "Convergent renderStatusSection({$section}): " . $e->getMessage());
+            return ['status' => false, 'message' => 'Could not load this section: ' . $e->getMessage()];
+        }
+
+        return ['status' => true, 'section' => $section, 'html' => $html];
     }
 
     /**
